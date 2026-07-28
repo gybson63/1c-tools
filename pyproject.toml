@@ -1,0 +1,112 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cfe-tools"
+version = "0.1.0"
+description = "Build 1C configuration extensions (CFE) from Designer dump diffs via ibcmd"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Timur Gazaliev" }]
+dependencies = [
+    "lxml>=4.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.12",
+    "mypy>=1.17",
+    "pylint>=3.3",
+    "pre-commit>=4.0",
+    "types-lxml",
+]
+
+[project.scripts]
+cfe-from-diff = "cfe_tools.cli:main"
+cfe-from-diff-gui = "cfe_tools.gui_app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/cfe_tools/vendor/**" = ["ALL"]
+"tests/fixtures_builder.py" = ["E501"]
+"tests/**" = ["B011"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cfe_tools", "fixtures_builder"]
+
+[tool.mypy]
+python_version = "3.10"
+mypy_path = "src"
+packages = ["cfe_tools"]
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["cfe_tools.vendor.*"]
+ignore_errors = true
+
+[tool.pylint.main]
+jobs = 0
+py-version = "3.10"
+source-roots = ["src"]
+ignore-paths = ["^.*/vendor/.*$"]
+init-hook = "import sys; sys.path.insert(0, 'tests')"
+
+[tool.pylint.messages_control]
+disable = [
+    "missing-module-docstring",
+    "missing-class-docstring",
+    "missing-function-docstring",
+    "too-few-public-methods",
+    "too-many-arguments",
+    "too-many-positional-arguments",
+    "too-many-locals",
+    "too-many-branches",
+    "too-many-statements",
+    "too-many-instance-attributes",
+    "duplicate-code",
+    "fixme",
+    "import-outside-toplevel",
+    "attribute-defined-outside-init",
+    "broad-exception-caught",
+    "subprocess-run-check",
+    "disallowed-name",
+    "redefined-outer-name",
+    "wrong-import-order",
+]
+
+[tool.pylint.format]
+max-line-length = 120
+
+[tool.pylint.design]
+max-args = 12
+max-locals = 25
