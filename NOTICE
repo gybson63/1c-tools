@@ -1,0 +1,9 @@
+This project includes adapted scripts from cc-1c-skills
+(https://github.com/Nikolay-Shirokov/cc-1c-skills):
+
+- cfe-init
+- cfe-borrow
+- cfe-validate
+
+Upstream license: see the source repository.
+Adapted files live under src/cfe_tools/vendor/.

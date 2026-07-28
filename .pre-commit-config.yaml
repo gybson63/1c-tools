@@ -1,0 +1,32 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.12.5
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.17.0
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - types-lxml
+          - lxml>=4.9
+        args: [--config-file=pyproject.toml]
+        pass_filenames: false
+        always_run: true
+
+  - repo: https://github.com/pylint-dev/pylint
+    rev: v3.3.7
+    hooks:
+      - id: pylint
+        additional_dependencies:
+          - lxml>=4.9
+          - pytest>=7.0
+        args:
+          - --rcfile=pyproject.toml
+          - src
+          - tests
+        pass_filenames: false
+        always_run: true
