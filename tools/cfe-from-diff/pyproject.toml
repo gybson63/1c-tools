@@ -15,8 +15,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Тесты (на рабочем ПК не нужны)
+test = ["pytest>=7.0"]
+# Локальная разработка / линтеры в монорепо
 dev = [
-    "pytest>=7.0",
+    "cfe-tools[test]",
     "ruff>=0.12",
     "mypy>=1.17",
     "pylint>=3.3",
@@ -52,9 +55,9 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"src/cfe_tools/vendor/**" = ["ALL"]
-"tests/fixtures_builder.py" = ["E501"]
-"tests/**" = ["B011"]
+"**/cfe_tools/vendor/**" = ["ALL"]
+"**/tests/fixtures_builder.py" = ["E501"]
+"**/tests/**" = ["B011"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["cfe_tools", "fixtures_builder"]
@@ -77,9 +80,9 @@ ignore_errors = true
 [tool.pylint.main]
 jobs = 0
 py-version = "3.10"
-source-roots = ["src"]
+source-roots = ["src", "tools/cfe-from-diff/src"]
 ignore-paths = ["^.*/vendor/.*$"]
-init-hook = "import sys; sys.path.insert(0, 'tests')"
+init-hook = "import sys; from pathlib import Path; root = Path('.').resolve(); paths = [root / 'src', root / 'tests', root / 'tools' / 'cfe-from-diff' / 'src', root / 'tools' / 'cfe-from-diff' / 'tests']; [sys.path.insert(0, str(p)) for p in paths if p.is_dir()]"
 
 [tool.pylint.messages_control]
 disable = [

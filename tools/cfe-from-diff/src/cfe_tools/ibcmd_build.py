@@ -111,7 +111,14 @@ def extension_exists(ibcmd: str, cfg: IbcmdConfig) -> bool:
     if proc.returncode != 0:
         return False
     text = (proc.stdout or "") + (proc.stderr or "")
-    return cfg.extension_name in text
+    name = cfg.extension_name
+    for line in text.splitlines():
+        tokens = line.replace(",", " ").split()
+        if name in tokens:
+            return True
+        if line.strip() == name:
+            return True
+    return False
 
 
 def build_cfe(cfg: IbcmdConfig) -> str:

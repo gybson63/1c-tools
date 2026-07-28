@@ -3,7 +3,11 @@
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 """Validates extension Configuration.xml: root, InternalInfo, extension properties, ChildObjects, borrowed objects."""
 
-import sys, os, argparse, re
+import argparse
+import os
+import re
+import sys
+
 from lxml import etree
 
 NS = {
@@ -871,7 +875,7 @@ def main():
             r.warn(f"11. {ctx}: Ext/Form/Module.bsl missing")
 
         # Read Form.xml as raw text for BaseForm checks
-        with open(form_xml_file, "r", encoding="utf-8-sig") as f:
+        with open(form_xml_file, encoding="utf-8-sig") as f:
             form_raw_text = f.read()
 
         if "<BaseForm" in form_raw_text:
@@ -1023,17 +1027,20 @@ def validate_extension(extension_path, detailed=False, max_errors=30, out_file="
     if out_file:
         argv.extend(["-OutFile", out_file])
 
-    old_argv = sys.argv
-    try:
-        sys.argv = argv
-        main()
-        return 0
-    except SystemExit as exc:
-        code = exc.code
-        if code in (0, None):
+    from cfe_tools.vendor import ARGV_LOCK
+
+    with ARGV_LOCK:
+        old_argv = sys.argv
+        try:
+            sys.argv = argv
+            main()
             return 0
-        if isinstance(code, int):
-            return code
-        raise CfeValidateError(f"cfe-validate failed: {code}") from exc
-    finally:
-        sys.argv = old_argv
+        except SystemExit as exc:
+            code = exc.code
+            if code in (0, None):
+                return 0
+            if isinstance(code, int):
+                return code
+            raise CfeValidateError(f"cfe-validate failed: {code}") from exc
+        finally:
+            sys.argv = old_argv

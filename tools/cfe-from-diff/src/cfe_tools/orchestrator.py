@@ -50,6 +50,27 @@ def _read_name_prefix(extension_root: Path) -> str:
     return "Ext_"
 
 
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _assert_safe_output_wipe(output_root: Path, *protected: Path) -> None:
+    """Refuse rmtree when output equals or contains a protected path (config/changes)."""
+    out = output_root.resolve()
+    if out.anchor and out == Path(out.anchor):
+        raise CfeInitError(f"Refusing to delete filesystem root as output: {out}")
+    for raw in protected:
+        prot = raw.resolve()
+        if out == prot:
+            raise CfeInitError(f"Refusing to delete output that equals a protected path: {out}")
+        if _is_relative_to(prot, out):
+            raise CfeInitError(f"Refusing to delete output that contains protected path {prot}: {out}")
+
+
 def run_cfe_from_diff(
     name: str,
     config: str | Path,
@@ -102,6 +123,7 @@ def run_cfe_from_diff(
 
     if output_root.exists() and (output_root / "Configuration.xml").exists():
         if force_output:
+            _assert_safe_output_wipe(output_root, config_root, changes_root)
             shutil.rmtree(output_root)
         else:
             raise CfeInitError(
@@ -148,23 +170,26 @@ def run_cfe_from_diff(
         report.warnings.append(f"cfe-validate reported errors (exit={report.validate_errors})")
 
     if not skip_build:
-        if not cfe or not ib_path:
-            raise IbcmdError("Building .cfe requires --cfe and --ib-path (or pass --skip-build)")
-        build_cfe(
-            IbcmdConfig(
-                ib_path=str(Path(ib_path).resolve()),
-                extension_name=name,
-                extension_src=str(output_root),
-                cfe_path=str(Path(cfe).resolve()),
-                name_prefix=name_prefix,
-                purpose=purpose,
-                ibcmd=ibcmd,
-                user=user,
-                password=password,
+        if report.validate_errors:
+            report.warnings.append(f"Skipping ibcmd build due to {report.validate_errors} validate error(s)")
+        else:
+            if not cfe or not ib_path:
+                raise IbcmdError("Building .cfe requires --cfe and --ib-path (or pass --skip-build)")
+            build_cfe(
+                IbcmdConfig(
+                    ib_path=str(Path(ib_path).resolve()),
+                    extension_name=name,
+                    extension_src=str(output_root),
+                    cfe_path=str(Path(cfe).resolve()),
+                    name_prefix=name_prefix,
+                    purpose=purpose,
+                    ibcmd=ibcmd,
+                    user=user,
+                    password=password,
+                )
             )
-        )
-        report.built = True
-        report.cfe = str(Path(cfe).resolve())
+            report.built = True
+            report.cfe = str(Path(cfe).resolve())
 
     _write_report(report, report_path)
     return report

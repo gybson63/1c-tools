@@ -142,11 +142,61 @@ def test_export_and_prepare_changes(tmp_path: Path):
     assert parent == h1
 
 
+def test_range_for_commit(tmp_path: Path):
+    from cfe_tools.git_staging import range_for_commit, resolve_commit
+
+    repo = _init_repo(tmp_path)
+    h1 = _commit_file(repo, "a.txt", "1", "first")
+    h2 = _commit_file(repo, "a.txt", "2", "second")
+    short = h2[:7]
+    assert resolve_commit(repo, short) == h2
+    frm, to = range_for_commit(repo, short)
+    assert to == h2
+    assert frm == h1
+
+
 def test_prepare_empty_range_raises(tmp_path: Path):
     repo = _init_repo(tmp_path)
     h = _commit_file(repo, "a.txt", "x", "only")
     with pytest.raises(GitError, match="No changed files"):
         prepare_changes_from_git(repo, h, h)
+
+
+def test_prepare_pair_from_git(tmp_path: Path):
+    import shutil
+
+    from cfe_tools.git_staging import prepare_pair_from_git
+    from cfe_tools.inventory import build_inventory
+
+    repo = _init_repo(tmp_path)
+    _commit_file(repo, "src/cf/Configuration.xml", "<cfg/>", "cfg")
+    h_base = _commit_file(repo, "src/cf/Catalogs/X.xml", "old", "base")
+    h_new = _commit_file(repo, "src/cf/Catalogs/X.xml", "new", "change")
+
+    pair = prepare_pair_from_git(repo, h_base, h_new, dump_prefix="src/cf/")
+    assert pair.config_from_git
+    assert (pair.config_dir / "Catalogs" / "X.xml").read_text(encoding="utf-8") == "old"
+    assert (pair.config_dir / "Configuration.xml").is_file()
+    assert (pair.changes.staging_dir / "Catalogs" / "X.xml").read_text(encoding="utf-8") == "new"
+    inv = build_inventory(pair.config_dir, pair.changes.staging_dir)
+    assert inv.changed_files
+
+    # Override: use already exported config dir
+    override = tmp_path / "override-cfg"
+    shutil.copytree(pair.config_dir, override)
+    pair2 = prepare_pair_from_git(
+        repo,
+        h_base,
+        h_new,
+        dump_prefix="src/cf/",
+        config_dir=override,
+        changes_dir=tmp_path / "ch-out",
+    )
+    assert not pair2.config_from_git
+    assert pair2.config_dir == override.resolve()
+
+    for d in pair.temp_dirs:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def test_map_repo_paths_to_objects():
@@ -169,3 +219,21 @@ def test_map_form_path():
         ["Catalogs/Товар/Forms/ФормаЭлемента/Ext/Form/Module.bsl"],
     )
     assert any(r.form_name == "ФормаЭлемента" for r in refs)
+
+
+def test_export_rejects_path_traversal(tmp_path: Path):
+    repo = _init_repo(tmp_path)
+    h = _commit_file(repo, "Catalogs/Safe.xml", "ok", "base")
+    # Craft a tree path that would escape staging if joined naively
+    staging = tmp_path / "staging"
+    result = export_changes_tree(
+        repo,
+        h,
+        staging,
+        ["Catalogs/../../outside.txt", "Catalogs/Safe.xml"],
+        dump_prefix="",
+    )
+    assert result.exported == 1
+    assert (staging / "Catalogs" / "Safe.xml").is_file()
+    assert not (tmp_path / "outside.txt").exists()
+    assert any("unsafe" in w.lower() or "outside" in w.lower() for w in result.warnings)

@@ -148,7 +148,7 @@ def transfer_new_attributes(
             ext_tree.write(ext_xml, encoding="utf-8", xml_declaration=True)
             # ensure BOM
             _ensure_bom(ext_xml)
-            inventory.warnings.append(f"Transferred {added} new child object(s) into {ext_xml.name}")
+            warnings.append(f"Transferred {added} new child object(s) into {ext_xml.name}")
     return warnings
 
 

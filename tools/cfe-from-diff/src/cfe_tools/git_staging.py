@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 import shutil
 import subprocess
 import tempfile
+import zipfile
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -41,6 +44,16 @@ class StagingResult:
     repo_paths: list[str]
     dump_paths: list[str]
     warnings: list[str]
+
+
+@dataclass
+class GitPairResult:
+    """Base config (DiffFrom) + changes staging (DiffTo) prepared from one git repo."""
+
+    config_dir: Path
+    changes: StagingResult
+    config_from_git: bool = True
+    temp_dirs: list[Path] = field(default_factory=list)
 
 
 def _run_git(
@@ -218,11 +231,33 @@ def get_file_diff(
     return proc.stdout or ""
 
 
+def resolve_commit(repo: str | Path, rev: str) -> str:
+    """Resolve a revision (full/short hash, tag, HEAD, …) to a full commit hash."""
+    repo = assert_git_repo(repo)
+    rev = rev.strip()
+    if not rev:
+        raise GitError("Empty revision")
+    proc = _run_git(repo, ["rev-parse", "--verify", f"{rev}^{{commit}}"])
+    return proc.stdout.strip()
+
+
 def commit_parent(repo: str | Path, commit: str) -> str:
     """Return first parent of commit (commit~1)."""
     repo = assert_git_repo(repo)
-    proc = _run_git(repo, ["rev-parse", f"{commit}^"])
+    commit = resolve_commit(repo, commit)
+    proc = _run_git(repo, ["rev-parse", f"{commit}^"], check=False)
+    if proc.returncode != 0:
+        raise GitError(
+            f"Commit {commit[:12]} has no parent (root commit). Specify Diff From manually or choose another commit."
+        )
     return proc.stdout.strip()
+
+
+def range_for_commit(repo: str | Path, commit: str) -> tuple[str, str]:
+    """Return (parent, commit) for a single commit id — changes introduced by that commit."""
+    to_rev = resolve_commit(repo, commit)
+    from_rev = commit_parent(repo, to_rev)
+    return from_rev, to_rev
 
 
 def export_blob_to_file(repo: str | Path, object_spec: str, dest_path: str | Path) -> bool:
@@ -273,12 +308,24 @@ def export_changes_tree(
     dump_paths: list[str] = []
     exported = 0
 
+    staging_resolved = staging.resolve()
     for rel in rel_paths:
         rel_posix = rel.replace("\\", "/")
         dump_rel = strip_dump_prefix(rel_posix, prefix)
         if not dump_rel.strip():
             continue
-        dest = staging / Path(*dump_rel.split("/"))
+        parts = [p for p in dump_rel.split("/") if p and p != "."]
+        if not parts or any(p == ".." for p in parts):
+            warnings.append(f"Skip unsafe path: {dump_rel}")
+            continue
+        dest = staging.joinpath(*parts)
+        try:
+            if not dest.resolve().is_relative_to(staging_resolved):
+                warnings.append(f"Skip path outside staging: {dump_rel}")
+                continue
+        except OSError:
+            warnings.append(f"Skip unresolvable path: {dump_rel}")
+            continue
         ok = export_blob_to_file(repo, f"{diff_to}:{rel_posix}", dest)
         if not ok:
             warnings.append(f"Skip (missing in {diff_to}): {rel_posix}")
@@ -294,6 +341,76 @@ def export_changes_tree(
         dump_paths=dump_paths,
         warnings=warnings,
     )
+
+
+def export_tree_at_revision(
+    repo: str | Path,
+    rev: str,
+    dest_dir: str | Path,
+    *,
+    dump_prefix: str | None = None,
+) -> Path:
+    """
+    Export hierarchical dump tree at ``rev`` into ``dest_dir`` via ``git archive``.
+
+    If DumpPrefix is set, only that subtree is exported and lands at the root of dest
+    (so dest looks like a Designer dump: Catalogs/, Configuration.xml, …).
+    """
+    repo = assert_git_repo(repo)
+    dest = Path(dest_dir)
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    prefix = normalize_dump_prefix(dump_prefix).rstrip("/")
+    treeish = f"{rev}:{prefix}" if prefix else rev
+
+    if prefix:
+        probe = _run_git(repo, ["ls-tree", "-d", "--name-only", rev, "--", prefix], check=False)
+        if probe.returncode != 0 or not (probe.stdout or "").strip():
+            # Also accept a blob-less path that is a tree via ls-tree without -d
+            probe2 = _run_git(repo, ["ls-tree", "--name-only", rev, "--", prefix], check=False)
+            if probe2.returncode != 0 or not (probe2.stdout or "").strip():
+                raise GitError(
+                    f"Cannot export dump at {treeish!r}. "
+                    "Check Diff From and DumpPrefix (path to CF dump inside the repo)."
+                )
+    else:
+        probe = _run_git(repo, ["rev-parse", "--verify", f"{rev}^{{commit}}"], check=False)
+        if probe.returncode != 0:
+            raise GitError(f"Cannot resolve revision {rev!r}")
+
+    fd, zip_name = tempfile.mkstemp(prefix="cfe-archive-", suffix=".zip")
+    os.close(fd)
+    zip_path = Path(zip_name)
+    try:
+        arch = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "archive",
+                "--format=zip",
+                "-o",
+                str(zip_path),
+                treeish,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if arch.returncode != 0:
+            err = (arch.stderr or arch.stdout or "").strip()
+            raise GitError(f"git archive failed for {treeish}: {err}")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(dest)
+    finally:
+        with contextlib.suppress(OSError):
+            zip_path.unlink(missing_ok=True)
+
+    return dest.resolve()
 
 
 def prepare_changes_from_git(
@@ -333,6 +450,58 @@ def prepare_changes_from_git(
     if result.exported == 0:
         raise GitError("Failed to export any files into staging")
     return result
+
+
+def prepare_pair_from_git(
+    repo: str | Path,
+    diff_from: str,
+    diff_to: str,
+    *,
+    dump_prefix: str | None = None,
+    pathspec: Sequence[str] | None = None,
+    config_dir: str | Path | None = None,
+    changes_dir: str | Path | None = None,
+) -> GitPairResult:
+    """
+    Prepare both sides from one git repository:
+
+    - config = full dump tree at DiffFrom (or use existing config_dir override)
+    - changes = ACMR files at DiffTo
+    """
+    temp_dirs: list[Path] = []
+
+    use_temp_config = config_dir is None or str(config_dir).strip() == ""
+    if use_temp_config:
+        cfg = Path(tempfile.mkdtemp(prefix="cfe-config-"))
+        temp_dirs.append(cfg)
+        export_tree_at_revision(repo, diff_from, cfg, dump_prefix=dump_prefix)
+        config_from_git = True
+    else:
+        assert config_dir is not None
+        cfg = Path(config_dir).resolve()
+        if not cfg.is_dir():
+            raise GitError(f"Config override not found: {cfg}")
+        config_from_git = False
+
+    use_temp_changes = changes_dir is None or str(changes_dir).strip() == ""
+    staging_arg: str | Path | None = None if use_temp_changes else changes_dir
+    changes = prepare_changes_from_git(
+        repo,
+        diff_from,
+        diff_to,
+        dump_prefix=dump_prefix,
+        pathspec=pathspec,
+        staging_dir=staging_arg,
+    )
+    if use_temp_changes:
+        temp_dirs.append(changes.staging_dir)
+
+    return GitPairResult(
+        config_dir=cfg.resolve(),
+        changes=changes,
+        config_from_git=config_from_git,
+        temp_dirs=temp_dirs,
+    )
 
 
 def map_repo_paths_to_objects(

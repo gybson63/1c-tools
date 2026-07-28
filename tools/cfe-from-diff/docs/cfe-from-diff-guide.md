@@ -60,20 +60,21 @@ GUI повторяет сценарий этого гайда, но без пр�
 | Выбрать как To | `DiffTo = commit`, `DiffFrom = commit^` |
 | Показать изменения | `git diff --name-only --diff-filter=ACMR` + маппинг в объекты метаданных |
 | Клик по файлу | Unified diff `From..To` для файла |
-| Запустить пайплайн | Staging blobs @ To → `cfe-from-diff` (XML и опционально `.cfe`) |
+| Запустить пайплайн | Config = dump @ From, Changes = файлы @ To → `cfe-from-diff` |
 | Только dry-run | То же с `--dry-run` (только инвентаризация) |
 
-Поля **Config**, **DumpPrefix**, **Skip build**, **Force**, **IB path** соответствуют параметрам скрипта из разделов ниже. «Свои коммиты» не появятся, если в git не настроены `user.name` / `user.email`.
+Отдельный каталог Config не нужен: база выгружается из git на DiffFrom. DumpPrefix — если выгрузка CF лежит в подкаталоге репо. IB path нужен только для сборки `.cfe`.
 
 ---
 
 ## 1. Установка cfe-tools
 
-В каталоге репозитория `1c-tools`:
+В каталоге инструмента (в монорепо: `tools/cfe-from-diff`, либо скопированная папка):
 
 ```powershell
-cd C:\Git\1c-tools
-python -m pip install -e ".[dev]"
+cd C:\path\to\cfe-from-diff
+python -m pip install .
+# для разработки/тестов: python -m pip install -e ".[dev]"
 ```
 
 Проверка:
@@ -97,7 +98,7 @@ $CfeFromDiff = @("python", "-m", "cfe_tools.cli")
 Не обязательно, но удобно: скопируйте шаблон под свою задачу, чтобы не затирать общий файл при обновлении репозитория.
 
 ```powershell
-copy C:\Git\1c-tools\scripts\run-cfe-from-diff.ps1 C:\work\run-K7-20486.ps1
+copy C:\path\to\cfe-from-diff\scripts\run-cfe-from-diff.ps1 C:\work\run-K7-20486.ps1
 notepad C:\work\run-K7-20486.ps1
 ```
 
