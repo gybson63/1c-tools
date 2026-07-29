@@ -4,21 +4,129 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+import time
 import zipfile
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from cfe_tools.cancel import CancelledError, is_cancelled, set_kill_callback
+from cfe_tools.cancel import check as cancel_check
+
 if TYPE_CHECKING:
     from cfe_tools.inventory import ObjectRef
+
+ProgressCallback = Callable[[str], None]
+
+# Git C-quoted string with octal bytes, e.g. "Documents/\320\227\320\260\320\272..."
+_GIT_C_QUOTED_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+_GIT_SIMPLE_ESCAPES = {
+    "a": 7,
+    "b": 8,
+    "t": 9,
+    "n": 10,
+    "v": 11,
+    "f": 12,
+    "r": 13,
+    '"': 34,
+    "\\": 92,
+}
 
 
 class GitError(Exception):
     """Raised when a git invocation fails or the repo is invalid."""
+
+
+def decode_git_c_quoted(inner: str) -> str:
+    """Decode the inside of a git C-quoted string (octal escapes → UTF-8 text)."""
+    raw = bytearray()
+    i = 0
+    n = len(inner)
+    while i < n:
+        ch = inner[i]
+        if ch != "\\":
+            raw.extend(ch.encode("utf-8"))
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            raw.append(ord("\\"))
+            break
+        esc = inner[i]
+        if esc in "01234567":
+            j = i
+            while j < n and j < i + 3 and inner[j] in "01234567":
+                j += 1
+            raw.append(int(inner[i:j], 8) & 0xFF)
+            i = j
+            continue
+        if esc in _GIT_SIMPLE_ESCAPES:
+            raw.append(_GIT_SIMPLE_ESCAPES[esc])
+            i += 1
+            continue
+        raw.extend(esc.encode("utf-8"))
+        i += 1
+    return raw.decode("utf-8", errors="replace")
+
+
+def decode_git_quoted_paths(text: str) -> str:
+    """Unquote git path strings like ``\"a/...\\320\\227...\"`` into readable UTF-8."""
+
+    def _repl(match: re.Match[str]) -> str:
+        inner = match.group(1)
+        if "\\" not in inner:
+            return match.group(0)
+        return decode_git_c_quoted(inner)
+
+    return _GIT_C_QUOTED_RE.sub(_repl, text)
+
+
+def _subprocess_hidden_kwargs() -> dict:
+    """Avoid flashing/lingering console windows for console-subsystem tools on Windows."""
+    if os.name != "nt":
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+
+
+def _run_cancellable(
+    cmd: list[str],
+    *,
+    poll_s: float = 0.2,
+) -> subprocess.CompletedProcess[str]:
+    """Run a long subprocess; kill it if cancel is requested."""
+    cancel_check()
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        **_subprocess_hidden_kwargs(),
+    )
+
+    def _kill() -> None:
+        if proc.poll() is None:
+            proc.kill()
+
+    set_kill_callback(_kill)
+    try:
+        while proc.poll() is None:
+            if is_cancelled():
+                proc.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5)
+                raise CancelledError("Операция отменена")
+            time.sleep(poll_s)
+        stdout, stderr = proc.communicate()
+    finally:
+        set_kill_callback(None)
+    return subprocess.CompletedProcess(cmd, proc.returncode or 0, stdout or "", stderr or "")
 
 
 @dataclass(frozen=True)
@@ -63,13 +171,15 @@ def _run_git(
     check: bool = True,
     text: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    cmd = ["git", "-C", str(repo), *args]
+    # quotepath=false → Cyrillic paths as UTF-8, not \320\227...
+    cmd = ["git", "-C", str(repo), "-c", "core.quotepath=false", *args]
     proc = subprocess.run(
         cmd,
         capture_output=True,
         text=text,
         encoding="utf-8" if text else None,
         errors="replace" if text else None,
+        **_subprocess_hidden_kwargs(),
     )
     if check and proc.returncode != 0:
         err = (proc.stderr or b"" if not text else proc.stderr) or ""
@@ -89,6 +199,69 @@ def assert_git_repo(repo: str | Path) -> Path:
     return path
 
 
+def find_git_root(start: str | Path) -> Path:
+    """Walk up from *start* until ``.git`` is found; return work-tree root."""
+    path = Path(start).resolve()
+    if not path.is_dir():
+        raise GitError(f"Path not found: {path}")
+    cur = path
+    while True:
+        if (cur / ".git").exists():
+            proc = _run_git(cur, ["rev-parse", "--show-toplevel"], check=False)
+            top = (proc.stdout or "").strip()
+            if proc.returncode == 0 and top:
+                return Path(top).resolve()
+            raise GitError(f"Found .git at {cur}, but cannot resolve git work tree")
+        parent = cur.parent
+        if parent == cur:
+            raise GitError(f"Git-репозиторий не найден выше каталога: {path}")
+        cur = parent
+
+
+def resolve_cf_location(cf_path: str | Path) -> tuple[Path, str]:
+    """Map ``Configuration.xml`` (or its dump folder) to ``(git_root, dump_prefix)``.
+
+    *cf_path* must be the ``Configuration.xml`` file of the hierarchical CF dump,
+    or (for compatibility) the dump directory that contains that file.
+
+    *dump_prefix* is the dump folder relative to the git root (posix, no trailing
+    slash), or empty when the dump is at the repo root.
+    """
+    path = Path(cf_path).expanduser()
+    try:
+        path = path.resolve()
+    except OSError as exc:
+        raise GitError(f"Путь недоступен: {cf_path}") from exc
+
+    if path.is_file():
+        if path.name.lower() != "configuration.xml":
+            raise GitError(
+                f"Нужен файл Configuration.xml, выбран «{path.name}». "
+                "Укажите файл выгрузки основной конфигурации, не другой файл."
+            )
+        cf = path.parent
+    elif path.is_dir():
+        cfg = path / "Configuration.xml"
+        if not cfg.is_file():
+            raise GitError(
+                "Укажите файл Configuration.xml выгрузки CF (не каталог репозитория). "
+                f"В «{path}» файл Configuration.xml не найден."
+            )
+        cf = path
+    else:
+        raise GitError(
+            f"Файл Configuration.xml не найден: {path}. Выберите файл Configuration.xml из каталога выгрузки CF."
+        )
+
+    root = find_git_root(cf)
+    try:
+        rel = cf.relative_to(root)
+    except ValueError as exc:
+        raise GitError(f"Каталог CF {cf} не внутри репозитория {root}") from exc
+    prefix = "" if rel == Path(".") else rel.as_posix()
+    return root, prefix
+
+
 def get_git_identity(repo: str | Path) -> tuple[str, str]:
     """Return (user.name, user.email) for the repo (local or global)."""
     repo = assert_git_repo(repo)
@@ -97,6 +270,22 @@ def get_git_identity(repo: str | Path) -> tuple[str, str]:
     if not name and not email:
         raise GitError("git user.name / user.email are not configured. Set them so «own commits» can be filtered.")
     return name, email
+
+
+def commit_is_mine(
+    commit: CommitInfo,
+    *,
+    author_name: str | None = None,
+    author_email: str | None = None,
+) -> bool:
+    """True if commit author matches git identity (email OR name, case-insensitive)."""
+    email = (author_email or "").strip()
+    name = (author_name or "").strip()
+    if not email and not name:
+        return False
+    email_ok = bool(email) and commit.author_email.lower() == email.lower()
+    name_ok = bool(name) and commit.author_name.lower() == name.lower()
+    return email_ok or name_ok
 
 
 def normalize_dump_prefix(prefix: str | None) -> str:
@@ -115,26 +304,27 @@ def strip_dump_prefix(rel_path: str, dump_prefix: str | None) -> str:
     return rel
 
 
-def list_own_commits(
+def list_commits(
     repo: str | Path,
     *,
     max_count: int = 100,
+    own_only: bool = False,
     author_name: str | None = None,
     author_email: str | None = None,
 ) -> list[CommitInfo]:
-    """List commits on the current branch by the configured git identity."""
+    """List commits on the current branch; optionally filter by git identity."""
     repo = assert_git_repo(repo)
-    if author_name is None and author_email is None:
+    if own_only and author_name is None and author_email is None:
         author_name, author_email = get_git_identity(repo)
 
-    # Format: hash<SOH>short<SOH>subject<SOH>name<SOH>email<SOH>date
     sep = "\x01"
-    pretty = f"%H{sep}%h{sep}%s{sep}%an{sep}%ae{sep}%aI"
-    args = ["log", f"--max-count={max_count}", f"--pretty=format:{pretty}"]
-    # git --author is a regex/substring; prefer email, else name
-    author_filter = author_email or author_name or ""
-    if author_filter:
-        args.append(f"--author={author_filter}")
+    # Use git's %x01 escapes — more reliable than embedding SOH in the argv on Windows
+    pretty = "%H%x01%h%x01%s%x01%an%x01%ae%x01%aI"
+    # When filtering «own», take a wider window then match email OR name
+    fetch_count = max_count * 5 if own_only else max_count
+    args = ["log", f"--max-count={fetch_count}", f"--pretty=format:{pretty}"]
+    # Do not pass --author to git: email in config often differs from history;
+    # filter in Python with commit_is_mine (email OR name).
 
     proc = _run_git(repo, args)
     commits: list[CommitInfo] = []
@@ -152,22 +342,37 @@ def list_own_commits(
             parts[4],
             parts[5],
         )
-        # Tighten: exact email match when email is known
-        if author_email and ae.lower() != author_email.lower():
-            continue
-        if not author_email and author_name and an != author_name:
-            continue
-        commits.append(
-            CommitInfo(
-                hash=h,
-                short_hash=short,
-                subject=subject,
-                author_name=an,
-                author_email=ae,
-                author_date=date,
-            )
+        info = CommitInfo(
+            hash=h,
+            short_hash=short,
+            subject=subject,
+            author_name=an,
+            author_email=ae,
+            author_date=date,
         )
+        if own_only and not commit_is_mine(info, author_name=author_name, author_email=author_email):
+            continue
+        commits.append(info)
+        if len(commits) >= max_count:
+            break
     return commits
+
+
+def list_own_commits(
+    repo: str | Path,
+    *,
+    max_count: int = 100,
+    author_name: str | None = None,
+    author_email: str | None = None,
+) -> list[CommitInfo]:
+    """List commits on the current branch by the configured git identity."""
+    return list_commits(
+        repo,
+        max_count=max_count,
+        own_only=True,
+        author_name=author_name,
+        author_email=author_email,
+    )
 
 
 def list_changed_files(
@@ -228,7 +433,7 @@ def get_file_diff(
     ]
     proc = _run_git(repo, args, check=False)
     # Missing path / binary / identical → empty or non-zero is OK for display
-    return proc.stdout or ""
+    return decode_git_quoted_paths(proc.stdout or "")
 
 
 def resolve_commit(repo: str | Path, rev: str) -> str:
@@ -275,6 +480,7 @@ def export_blob_to_file(repo: str | Path, object_spec: str, dest_path: str | Pat
         ["git", "-C", str(repo), "cat-file", "blob", blob_hash],
         capture_output=True,
         check=False,
+        **_subprocess_hidden_kwargs(),
     )
     if proc.returncode != 0:
         return False
@@ -380,11 +586,12 @@ def export_tree_at_revision(
         if probe.returncode != 0:
             raise GitError(f"Cannot resolve revision {rev!r}")
 
+    cancel_check()
     fd, zip_name = tempfile.mkstemp(prefix="cfe-archive-", suffix=".zip")
     os.close(fd)
     zip_path = Path(zip_name)
     try:
-        arch = subprocess.run(
+        arch = _run_cancellable(
             [
                 "git",
                 "-C",
@@ -394,16 +601,12 @@ def export_tree_at_revision(
                 "-o",
                 str(zip_path),
                 treeish,
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
+            ]
         )
         if arch.returncode != 0:
             err = (arch.stderr or arch.stdout or "").strip()
             raise GitError(f"git archive failed for {treeish}: {err}")
+        cancel_check()
         with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(dest)
     finally:
@@ -461,6 +664,7 @@ def prepare_pair_from_git(
     pathspec: Sequence[str] | None = None,
     config_dir: str | Path | None = None,
     changes_dir: str | Path | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> GitPairResult:
     """
     Prepare both sides from one git repository:
@@ -469,39 +673,52 @@ def prepare_pair_from_git(
     - changes = ACMR files at DiffTo
     """
     temp_dirs: list[Path] = []
+    cancel_check()
 
-    use_temp_config = config_dir is None or str(config_dir).strip() == ""
-    if use_temp_config:
-        cfg = Path(tempfile.mkdtemp(prefix="cfe-config-"))
-        temp_dirs.append(cfg)
-        export_tree_at_revision(repo, diff_from, cfg, dump_prefix=dump_prefix)
-        config_from_git = True
-    else:
-        assert config_dir is not None
-        cfg = Path(config_dir).resolve()
-        if not cfg.is_dir():
-            raise GitError(f"Config override not found: {cfg}")
-        config_from_git = False
+    def progress(msg: str) -> None:
+        if on_progress is not None:
+            on_progress(msg)
 
-    use_temp_changes = changes_dir is None or str(changes_dir).strip() == ""
-    staging_arg: str | Path | None = None if use_temp_changes else changes_dir
-    changes = prepare_changes_from_git(
-        repo,
-        diff_from,
-        diff_to,
-        dump_prefix=dump_prefix,
-        pathspec=pathspec,
-        staging_dir=staging_arg,
-    )
-    if use_temp_changes:
-        temp_dirs.append(changes.staging_dir)
+    try:
+        use_temp_config = config_dir is None or str(config_dir).strip() == ""
+        if use_temp_config:
+            cfg = Path(tempfile.mkdtemp(prefix="cfe-config-"))
+            temp_dirs.append(cfg)
+            progress(f"Выгрузка базы из git ({diff_from})…")
+            export_tree_at_revision(repo, diff_from, cfg, dump_prefix=dump_prefix)
+            config_from_git = True
+        else:
+            assert config_dir is not None
+            cfg = Path(config_dir).resolve()
+            if not cfg.is_dir():
+                raise GitError(f"Config override not found: {cfg}")
+            config_from_git = False
 
-    return GitPairResult(
-        config_dir=cfg.resolve(),
-        changes=changes,
-        config_from_git=config_from_git,
-        temp_dirs=temp_dirs,
-    )
+        cancel_check()
+        use_temp_changes = changes_dir is None or str(changes_dir).strip() == ""
+        staging_arg: str | Path | None = None if use_temp_changes else changes_dir
+        progress(f"Подготовка изменений из git ({diff_from}…{diff_to})…")
+        changes = prepare_changes_from_git(
+            repo,
+            diff_from,
+            diff_to,
+            dump_prefix=dump_prefix,
+            pathspec=pathspec,
+            staging_dir=staging_arg,
+        )
+        if use_temp_changes:
+            temp_dirs.append(changes.staging_dir)
+
+        return GitPairResult(
+            config_dir=cfg.resolve(),
+            changes=changes,
+            config_from_git=config_from_git,
+            temp_dirs=temp_dirs,
+        )
+    except Exception:
+        for d in temp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+        raise
 
 
 def map_repo_paths_to_objects(

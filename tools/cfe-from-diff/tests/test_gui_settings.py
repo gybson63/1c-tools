@@ -10,7 +10,7 @@ from cfe_tools.gui_settings import load_settings, save_settings
 def test_save_and_load_roundtrip(tmp_path: Path):
     path = tmp_path / "gui-settings.json"
     data = {
-        "git_repo": r"C:\repo",
+        "config": r"C:\repo\src\cf",
         "ib_path": r"C:\ib",
         "ibcmd": r"C:\Program Files\1cv8\bin\ibcmd.exe",
         "skip_build": True,
@@ -19,7 +19,7 @@ def test_save_and_load_roundtrip(tmp_path: Path):
     saved = save_settings(data, path=path)
     assert saved == path
     loaded = load_settings(path)
-    assert loaded["git_repo"] == data["git_repo"]
+    assert loaded["config"] == data["config"]
     assert loaded["ibcmd"] == data["ibcmd"]
     assert loaded["skip_build"] is True
     assert loaded["version"] == 1

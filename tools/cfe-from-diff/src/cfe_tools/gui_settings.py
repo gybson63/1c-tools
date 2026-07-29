@@ -24,19 +24,17 @@ PERSIST_STRINGS = (
     "name",
     "purpose",
     "prefix",
-    "git_repo",
-    "dump_prefix",
+    "config",
     "output",
-    "cfe",
     "ib_path",
     "ibcmd",
     "user",
-    "commit_id",
 )
 
 PERSIST_BOOLS = (
     "skip_build",
     "force",
+    "own_commits_only",
 )
 
 

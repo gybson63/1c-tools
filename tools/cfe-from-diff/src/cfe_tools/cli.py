@@ -87,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             report_path=args.report,
             force_output=args.force,
+            on_progress=lambda msg: print(f"[…] {msg}"),
         )
     except (CfeInitError, CfeBorrowError, IbcmdError, FileNotFoundError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
@@ -97,12 +98,16 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Borrowed: {len(report.borrowed)}")
     print(f"  New:      {len(report.new_objects)}")
     print(f"  BSL:      {len(report.bsl_files)}")
+    print(f"  Templates:{len(report.template_files)}")
     print(f"  Built:    {report.built}")
     if report.cfe:
         print(f"  CFE:      {report.cfe}")
     for w in report.warnings:
         print(f"  [WARN] {w}")
-    return 1 if report.validate_errors and not args.dry_run else 0
+    # Validate remarks are warnings; fail only when build was required and did not run
+    if args.dry_run or args.skip_build:
+        return 0
+    return 0 if report.built else 1
 
 
 if __name__ == "__main__":

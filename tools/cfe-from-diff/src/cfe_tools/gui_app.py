@@ -5,21 +5,28 @@ from __future__ import annotations
 import contextlib
 import queue
 import shutil
+import sys
 import threading
 import tkinter as tk
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from cfe_tools.cancel import CancelledError, request_cancel
+from cfe_tools.cancel import reset as cancel_reset
 from cfe_tools.git_staging import (
     CommitInfo,
     GitError,
+    commit_is_mine,
     get_file_diff,
+    get_git_identity,
     list_changed_files,
-    list_own_commits,
+    list_commits,
     map_repo_paths_to_objects,
     prepare_pair_from_git,
     range_for_commit,
+    resolve_cf_location,
     strip_dump_prefix,
 )
 from cfe_tools.gui_settings import (
@@ -32,7 +39,7 @@ from cfe_tools.gui_settings import (
 from cfe_tools.gui_tooltip import tip
 from cfe_tools.ibcmd_build import IbcmdError
 from cfe_tools.inventory import build_inventory, map_path_to_object
-from cfe_tools.orchestrator import RunReport, run_cfe_from_diff
+from cfe_tools.orchestrator import RunReport, run_cfe_from_diff, validate_extension_names
 from cfe_tools.vendor.cfe_borrow import CfeBorrowError
 from cfe_tools.vendor.cfe_init import CfeInitError
 
@@ -76,24 +83,33 @@ class GuiApp:
         self.root.minsize(1000, 680)
 
         self._commits: list[CommitInfo] = []
+        self._commits_all: list[CommitInfo] = []
+        self._git_author_name: str = ""
+        self._git_author_email: str = ""
         self._changed_repo_paths: list[str] = []
         self._path_to_object: dict[str, str] = {}  # dump_rel -> borrow_spec or ""
         self._busy = False
         self._log_q: queue.Queue[str] = queue.Queue()
         self._save_after_id: str | None = None
+        self._refresh_commits_after_id: str | None = None
         self._loading_settings = False
+        self._progress_win: tk.Toplevel | None = None
+        self.var_progress = tk.StringVar(value="")
 
         self._build_vars()
         self._settings_loaded = bool(load_settings())
         self._load_persisted_settings()
         self._build_ui()
         self._attach_settings_traces()
+        self._update_git_hint()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._drain_log)
         if self._settings_loaded:
             self.log(f"Загружены настройки: {settings_path()}")
         # Re-apply visibility after settings load
         self._toggle_build_section()
+        # Commit list is empty until loaded — refresh once CF path is known
+        self.root.after(200, self._maybe_auto_refresh_commits)
 
     # ------------------------------------------------------------------ UI
     def _build_vars(self) -> None:
@@ -101,10 +117,8 @@ class GuiApp:
         self.var_purpose = tk.StringVar(value="Адаптация")
         self.var_prefix = tk.StringVar(value="")
         self.var_config = tk.StringVar(value="")
-        self.var_git_repo = tk.StringVar(value="")
-        self.var_dump_prefix = tk.StringVar(value="")
+        self.var_git_hint = tk.StringVar(value="")
         self.var_output = tk.StringVar(value="")
-        self.var_cfe = tk.StringVar(value="")
         self.var_ib_path = tk.StringVar(value="")
         self.var_ibcmd = tk.StringVar(value="")
         self.var_user = tk.StringVar(value="")
@@ -112,29 +126,29 @@ class GuiApp:
         self.var_changes = tk.StringVar(value="")
         self.var_diff_from = tk.StringVar(value="")
         self.var_diff_to = tk.StringVar(value="")
-        self.var_commit_id = tk.StringVar(value="")
+        self.var_commit_search = tk.StringVar(value="")
+        self.var_git_identity = tk.StringVar(value="")
         self.var_skip_build = tk.BooleanVar(value=True)
         self.var_dry_run = tk.BooleanVar(value=False)
         self.var_force = tk.BooleanVar(value=False)
         self.var_keep_changes = tk.BooleanVar(value=False)
+        self.var_own_commits_only = tk.BooleanVar(value=True)
         self.var_status = tk.StringVar(value="Готово")
 
         self._string_vars: dict[str, tk.StringVar] = {
             "name": self.var_name,
             "purpose": self.var_purpose,
             "prefix": self.var_prefix,
-            "git_repo": self.var_git_repo,
-            "dump_prefix": self.var_dump_prefix,
+            "config": self.var_config,
             "output": self.var_output,
-            "cfe": self.var_cfe,
             "ib_path": self.var_ib_path,
             "ibcmd": self.var_ibcmd,
             "user": self.var_user,
-            "commit_id": self.var_commit_id,
         }
         self._bool_vars: dict[str, tk.BooleanVar] = {
             "skip_build": self.var_skip_build,
             "force": self.var_force,
+            "own_commits_only": self.var_own_commits_only,
         }
 
     def _load_persisted_settings(self) -> None:
@@ -154,6 +168,28 @@ class GuiApp:
             for key in PERSIST_BOOLS:
                 if key in data and key in self._bool_vars and isinstance(data[key], bool):
                     self._bool_vars[key].set(data[key])
+            # Migrate old git_repo + dump_prefix → config (Configuration.xml)
+            if not self.var_config.get().strip():
+                old_repo = data.get("git_repo")
+                old_prefix = data.get("dump_prefix")
+                if isinstance(old_repo, str) and old_repo.strip():
+                    if isinstance(old_prefix, str) and old_prefix.strip():
+                        joined = Path(old_repo.strip()) / Path(old_prefix.strip().replace("\\", "/"))
+                        self.var_config.set(str(joined))
+                    else:
+                        self.var_config.set(old_repo.strip())
+            # Prefer Configuration.xml if a dump directory was saved earlier
+            cfg_val = self.var_config.get().strip()
+            if cfg_val:
+                cfg_path = Path(cfg_val)
+                if cfg_path.is_dir():
+                    xml = cfg_path / "Configuration.xml"
+                    if xml.is_file():
+                        self.var_config.set(str(xml))
+                elif cfg_path.name.lower() != "configuration.xml":
+                    sibling = cfg_path.parent / "Configuration.xml"
+                    if sibling.is_file():
+                        self.var_config.set(str(sibling))
             geom = data.get("geometry")
             if isinstance(geom, str) and geom.strip():
                 with contextlib.suppress(tk.TclError):
@@ -193,6 +229,44 @@ class GuiApp:
             string_var.trace_add("write", self._schedule_save_settings)
         for bool_var in self._bool_vars.values():
             bool_var.trace_add("write", self._schedule_save_settings)
+        self.var_config.trace_add("write", self._on_config_changed)
+
+    def _on_config_changed(self, *_args: object) -> None:
+        self._update_git_hint()
+        self._schedule_auto_refresh_commits()
+
+    def _update_git_hint(self, *_args: object) -> None:
+        cf = self.var_config.get().strip()
+        if not cf:
+            self.var_git_hint.set("")
+            return
+        try:
+            root, prefix = resolve_cf_location(cf)
+            pref = prefix or "(корень репозитория)"
+            self.var_git_hint.set(f"git: {root}  ·  префикс: {pref}")
+        except GitError as exc:
+            self.var_git_hint.set(str(exc))
+
+    def _schedule_auto_refresh_commits(self, *_args: object) -> None:
+        if self._loading_settings:
+            return
+        if self._refresh_commits_after_id is not None:
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(self._refresh_commits_after_id)
+        self._refresh_commits_after_id = self.root.after(700, self._maybe_auto_refresh_commits)
+
+    def _maybe_auto_refresh_commits(self) -> None:
+        self._refresh_commits_after_id = None
+        if self._busy:
+            return
+        cf = self.var_config.get().strip()
+        if not cf:
+            return
+        try:
+            resolve_cf_location(cf)
+        except GitError:
+            return
+        self.refresh_commits()
 
     def _on_close(self) -> None:
         if self._save_after_id is not None:
@@ -229,16 +303,32 @@ class GuiApp:
         if path:
             var.set(path)
 
-    def _browse_file(self, var: tk.StringVar, save: bool = False) -> None:
+    def _browse_file(
+        self,
+        var: tk.StringVar,
+        save: bool = False,
+        *,
+        title: str = "",
+        filetypes: list[tuple[str, str]] | None = None,
+    ) -> None:
+        types = filetypes or [("Все файлы", "*.*"), ("Программы", "*.exe")]
         if save:
-            path = filedialog.asksaveasfilename(
-                defaultextension=".cfe",
-                filetypes=[("Файл расширения", "*.cfe"), ("Все файлы", "*.*")],
-            )
+            path = filedialog.asksaveasfilename(title=title or None, filetypes=types)
         else:
-            path = filedialog.askopenfilename(filetypes=[("Все файлы", "*.*"), ("Программы", "*.exe")])
+            path = filedialog.askopenfilename(title=title or None, filetypes=types)
         if path:
             var.set(path)
+
+    def _browse_configuration_xml(self, var: tk.StringVar) -> None:
+        self._browse_file(
+            var,
+            title="Выберите Configuration.xml выгрузки CF (не каталог репозитория)",
+            filetypes=[
+                ("Configuration.xml", "Configuration.xml"),
+                ("XML-файлы", "*.xml"),
+                ("Все файлы", "*.*"),
+            ],
+        )
 
     def _add_path_row(
         self,
@@ -250,6 +340,7 @@ class GuiApp:
         hint: str,
         is_dir: bool = True,
         save: bool = False,
+        browse_config_xml: bool = False,
     ) -> None:
         lbl = ttk.Label(parent, text=label)
         lbl.grid(row=row, column=0, sticky="w", padx=2, pady=2)
@@ -257,7 +348,10 @@ class GuiApp:
         entry = ttk.Entry(parent, textvariable=var)
         entry.grid(row=row, column=1, sticky="ew", padx=2, pady=2)
         tip(entry, hint)
-        if is_dir:
+        if browse_config_xml:
+            btn = ttk.Button(parent, text="…", width=3, command=lambda: self._browse_configuration_xml(var))
+            tip(btn, "Выбрать файл Configuration.xml (не папку)")
+        elif is_dir:
             btn = ttk.Button(parent, text="…", width=3, command=lambda: self._browse_dir(var))
             tip(btn, "Выбрать каталог")
         else:
@@ -274,10 +368,10 @@ class GuiApp:
         r = 0
         lbl = ttk.Label(frm, text="Имя расширения")
         lbl.grid(row=r, column=0, sticky="w", padx=2, pady=2)
-        tip(lbl, "Имя расширения конфигурации 1С (например K7_20486)")
+        tip(lbl, "Имя расширения 1С: буквы, цифры, «_» (например K7_20486). Без «-».")
         ent = ttk.Entry(frm, textvariable=self.var_name)
         ent.grid(row=r, column=1, columnspan=2, sticky="ew", padx=2, pady=2)
-        tip(ent, "Имя расширения конфигурации 1С (например K7_20486)")
+        tip(ent, "Имя расширения 1С: буквы, цифры, «_» (например K7_20486). Без «-».")
         r += 1
 
         lbl = ttk.Label(frm, text="Назначение")
@@ -296,33 +390,28 @@ class GuiApp:
 
         lbl = ttk.Label(frm, text="Префикс имён")
         lbl.grid(row=r, column=0, sticky="w", padx=2, pady=2)
-        tip(lbl, "NamePrefix расширения. Пусто — будет «<имя>_»")
+        tip(lbl, "NamePrefix (буквы, цифры, «_»). Пусто — «<имя>_». Без «-».")
         ent = ttk.Entry(frm, textvariable=self.var_prefix)
         ent.grid(row=r, column=1, columnspan=2, sticky="ew", padx=2, pady=2)
-        tip(ent, "NamePrefix расширения. Пусто — будет «<имя>_»")
+        tip(ent, "NamePrefix (буквы, цифры, «_»). Пусто — «<имя>_». Без «-».")
         r += 1
 
         self._add_path_row(
             frm,
             r,
-            "Репозиторий git",
-            self.var_git_repo,
-            hint="Каталог git-репозитория с hierarchical XML-выгрузкой конфигурации",
+            "Configuration.xml",
+            self.var_config,
+            hint="Файл Configuration.xml из hierarchical XML-выгрузки основной CF "
+            "(выберите именно файл, не папку и не корень репозитория). "
+            "Корень git и префикс выгрузки определяются по расположению файла",
+            is_dir=False,
+            browse_config_xml=True,
         )
         r += 1
 
-        lbl = ttk.Label(frm, text="Префикс выгрузки")
-        lbl.grid(row=r, column=0, sticky="w", padx=2, pady=2)
-        tip(
-            lbl,
-            "Подкаталог выгрузки CF внутри репозитория (например src/cf/). Пусто — выгрузка в корне репозитория",
-        )
-        ent = ttk.Entry(frm, textvariable=self.var_dump_prefix)
-        ent.grid(row=r, column=1, columnspan=2, sticky="ew", padx=2, pady=2)
-        tip(
-            ent,
-            "Подкаталог выгрузки CF внутри репозитория (например src/cf/). Пусто — выгрузка в корне репозитория",
-        )
+        hint = ttk.Label(frm, textvariable=self.var_git_hint, foreground="#555555")
+        hint.grid(row=r, column=1, columnspan=2, sticky="ew", padx=2, pady=(0, 4))
+        tip(hint, "Автоматически: корень git-репозитория и относительный префикс выгрузки CF")
         r += 1
 
         self._add_path_row(
@@ -330,7 +419,7 @@ class GuiApp:
             r,
             "Каталог результата",
             self.var_output,
-            hint="Куда записать XML-исходники расширения",
+            hint="Куда записать XML расширения; файл .cfe при сборке будет здесь же: <имя>.cfe",
         )
         r += 1
 
@@ -356,18 +445,12 @@ class GuiApp:
         self._build_frm = ttk.LabelFrame(frm, text="Сборка файла .cfe")
         self._build_frm.grid(row=r, column=0, columnspan=3, sticky="ew", padx=2, pady=6)
         self._build_frm.columnconfigure(1, weight=1)
-        tip(self._build_frm, "Параметры сборки двоичного .cfe через ibcmd (нужна файловая ИБ)")
-        br = 0
-        self._add_path_row(
+        tip(
             self._build_frm,
-            br,
-            "Файл .cfe",
-            self.var_cfe,
-            hint="Путь выходного файла расширения .cfe",
-            is_dir=False,
-            save=True,
+            "Параметры сборки двоичного .cfe через ibcmd (нужна файловая ИБ). "
+            "Файл .cfe будет записан в каталог результата как «<имя расширения>.cfe»",
         )
-        br += 1
+        br = 0
         self._add_path_row(
             self._build_frm,
             br,
@@ -412,30 +495,29 @@ class GuiApp:
         frm.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         tip(frm, "Выбор коммита или диапазона изменений для расширения")
 
-        id_frm = ttk.Frame(frm)
-        id_frm.pack(fill=tk.X, padx=2, pady=2)
-        lbl = ttk.Label(id_frm, text="Идентификатор коммита")
-        lbl.pack(side=tk.LEFT)
-        tip(lbl, "Полный или короткий hash коммита. «Применить» выставит «С» = родитель, «По» = коммит")
-        id_entry = ttk.Entry(id_frm, textvariable=self.var_commit_id, width=28)
-        id_entry.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
-        tip(id_entry, "Полный или короткий hash коммита. Enter — то же, что «Применить»")
-        btn_apply = ttk.Button(id_frm, text="Применить", command=self.apply_commit_id)
-        btn_apply.pack(side=tk.LEFT, padx=2)
-        tip(btn_apply, "Разобрать идентификатор: «По» = коммит, «С» = его родитель, показать изменения")
-        id_entry.bind("<Return>", lambda _e: self.apply_commit_id())
-
         btns = ttk.Frame(frm)
         btns.pack(fill=tk.X, padx=2, pady=2)
         btn_ref = ttk.Button(btns, text="Обновить список", command=self.refresh_commits)
         btn_ref.pack(side=tk.LEFT, padx=2)
-        tip(btn_ref, "Загрузить свои коммиты текущей ветки (автор = git user.name / user.email)")
-        btn_sel = ttk.Button(btns, text="Выбрать из списка", command=self.select_commit_as_to)
-        btn_sel.pack(side=tk.LEFT, padx=2)
-        tip(btn_sel, "Взять выделенный в списке коммит как «По» (родитель — как «С»)")
+        tip(btn_ref, "Загрузить коммиты текущей ветки из git")
+        chk_own = ttk.Checkbutton(
+            btns,
+            text="Только свои",
+            variable=self.var_own_commits_only,
+            command=self._apply_commit_filters,
+        )
+        chk_own.pack(side=tk.LEFT, padx=4)
+        tip(
+            chk_own,
+            "Показывать только коммиты, где автор совпадает с git user.name или user.email. "
+            "Если список пуст — сверьте «Я: …» с колонкой «Автор»",
+        )
         btn_prev = ttk.Button(btns, text="Показать изменения", command=self.preview_changes)
         btn_prev.pack(side=tk.LEFT, padx=2)
         tip(btn_prev, "Показать изменённые объекты и файлы для диапазона «С»…«По»")
+        id_lbl = ttk.Label(btns, textvariable=self.var_git_identity, foreground="#555555")
+        id_lbl.pack(side=tk.LEFT, padx=8)
+        tip(id_lbl, "Текущий git user.name / user.email для фильтра «Только свои»")
 
         range_frm = ttk.Frame(frm)
         range_frm.pack(fill=tk.X, padx=2, pady=2)
@@ -452,24 +534,37 @@ class GuiApp:
         ent_to.pack(side=tk.LEFT, padx=4)
         tip(ent_to, "Ревизия «после»: из неё берутся изменённые файлы для расширения")
 
-        cols = ("short", "date", "subject")
-        self.commit_tree = ttk.Treeview(frm, columns=cols, show="headings", height=10, selectmode="browse")
-        self.commit_tree.heading("short", text="Хеш")
+        search_frm = ttk.Frame(frm)
+        search_frm.pack(fill=tk.X, padx=2, pady=2)
+        lbl = ttk.Label(search_frm, text="Поиск")
+        lbl.pack(side=tk.LEFT)
+        tip(lbl, "Фильтр по хешу, автору или тексту сообщения (без учёта регистра)")
+        ent_search = ttk.Entry(search_frm, textvariable=self.var_commit_search)
+        ent_search.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
+        tip(ent_search, "Подстрока в хеше, авторе или сообщении; список обновляется при вводе")
+        self.var_commit_search.trace_add("write", lambda *_a: self._apply_commit_filters())
+
+        tree_frm = ttk.Frame(frm)
+        tree_frm.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        cols = ("hash", "date", "author", "subject")
+        self.commit_tree = ttk.Treeview(tree_frm, columns=cols, show="headings", height=10, selectmode="browse")
+        self.commit_tree.heading("hash", text="Хеш")
         self.commit_tree.heading("date", text="Дата")
+        self.commit_tree.heading("author", text="Автор")
         self.commit_tree.heading("subject", text="Сообщение")
-        self.commit_tree.column("short", width=80, stretch=False)
-        self.commit_tree.column("date", width=160, stretch=False)
-        self.commit_tree.column("subject", width=360, stretch=True)
+        self.commit_tree.column("hash", width=200, stretch=False)
+        self.commit_tree.column("date", width=130, stretch=False)
+        self.commit_tree.column("author", width=120, stretch=False)
+        self.commit_tree.column("subject", width=240, stretch=True)
         tip(
             self.commit_tree,
-            "Список своих коммитов текущей ветки. Двойной щелчок — выбрать как «По»",
+            "Клик по коммиту — сразу показать его изменения (С = родитель, По = коммит)",
         )
-        scroll = ttk.Scrollbar(frm, orient=tk.VERTICAL, command=self.commit_tree.yview)
+        scroll = ttk.Scrollbar(tree_frm, orient=tk.VERTICAL, command=self.commit_tree.yview)
         self.commit_tree.configure(yscrollcommand=scroll.set)
-        self.commit_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(2, 0), pady=2)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y, pady=2)
+        self.commit_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.commit_tree.bind("<<TreeviewSelect>>", self._on_commit_select)
-        self.commit_tree.bind("<Double-1>", lambda _e: self.select_commit_as_to())
 
     def _build_objects_and_diff(self, parent: ttk.Frame) -> None:
         paned = ttk.Panedwindow(parent, orient=tk.VERTICAL)
@@ -529,9 +624,21 @@ class GuiApp:
         log_frm = ttk.LabelFrame(parent, text="Журнал")
         log_frm.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         tip(log_frm, "Ход выполнения и предупреждения")
-        self.log_text = tk.Text(log_frm, height=10, wrap=tk.WORD, font=("Consolas", 9))
+
+        log_bar = ttk.Frame(log_frm)
+        log_bar.pack(fill=tk.X, padx=2, pady=(2, 0))
+        btn_copy = ttk.Button(log_bar, text="Копировать", command=self._copy_log)
+        btn_copy.pack(side=tk.RIGHT, padx=2)
+        tip(btn_copy, "Скопировать журнал в буфер обмена (выделение — только его, иначе весь текст)")
+        btn_save = ttk.Button(log_bar, text="Сохранить…", command=self._save_log)
+        btn_save.pack(side=tk.RIGHT, padx=2)
+        tip(btn_save, "Сохранить журнал в текстовый файл")
+
+        log_body = ttk.Frame(log_frm)
+        log_body.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        self.log_text = tk.Text(log_body, height=10, wrap=tk.WORD, font=("Consolas", 9))
         tip(self.log_text, "Подробный журнал работы инструмента")
-        lscroll = ttk.Scrollbar(log_frm, orient=tk.VERTICAL, command=self.log_text.yview)
+        lscroll = ttk.Scrollbar(log_body, orient=tk.VERTICAL, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=lscroll.set)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         lscroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -539,6 +646,47 @@ class GuiApp:
     # ------------------------------------------------------------------ helpers
     def log(self, msg: str) -> None:
         self._log_q.put(msg)
+
+    def _log_contents(self) -> str:
+        return self.log_text.get("1.0", "end-1c")
+
+    def _copy_log(self) -> None:
+        try:
+            selected = self.log_text.get(tk.SEL_FIRST, tk.SEL_LAST)
+        except tk.TclError:
+            selected = ""
+        text = selected if selected else self._log_contents()
+        if not text.strip():
+            self.var_status.set("Журнал пуст")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update_idletasks()
+        self.var_status.set("Скопировано выделение журнала" if selected else "Журнал скопирован в буфер обмена")
+
+    def _save_log(self) -> None:
+        text = self._log_contents()
+        if not text.strip():
+            messagebox.showinfo("Журнал", "Журнал пуст — нечего сохранять.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Сохранить журнал",
+            defaultextension=".txt",
+            filetypes=[
+                ("Текстовые файлы", "*.txt"),
+                ("Все файлы", "*.*"),
+            ],
+            initialfile="cfe-from-diff-log.txt",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Ошибка", f"Не удалось сохранить журнал:\n{exc}")
+            return
+        self.var_status.set(f"Журнал сохранён: {path}")
+        self.log(f"Журнал сохранён: {path}")
 
     def _drain_log(self) -> None:
         try:
@@ -555,16 +703,119 @@ class GuiApp:
         if status is not None:
             self.var_status.set(status)
 
-    def _run_bg(self, work: Callable[[], None], status: str = "Выполняется…") -> None:
-        if self._busy:
-            messagebox.showinfo("Занято", "Дождитесь завершения текущей операции.")
+    def _show_progress(self, status: str) -> None:
+        """Модальное окно прогресса с кнопкой «Отменить»; блокирует основное окно."""
+        if self._progress_win is not None:
+            self.var_progress.set(status)
+            with contextlib.suppress(tk.TclError):
+                self._progress_win.update_idletasks()
             return
 
+        win = tk.Toplevel(self.root)
+        win.title("Выполняется…")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self._request_cancel)
+
+        frm = ttk.Frame(win, padding=16)
+        frm.grid(row=0, column=0, sticky="nsew")
+        win.columnconfigure(0, weight=1)
+        frm.columnconfigure(0, weight=1)
+
+        self.var_progress.set(status)
+        # Явная подпись этапа: без неё окно выглядит «пустым» при долгой операции.
+        lbl = ttk.Label(
+            frm,
+            textvariable=self.var_progress,
+            wraplength=380,
+            justify=tk.LEFT,
+            anchor="w",
+            font=("Segoe UI", 10),
+        )
+        lbl.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        tip(lbl, "Текущий этап операции.")
+
+        bar = ttk.Progressbar(frm, mode="indeterminate", length=380)
+        bar.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        bar.start(12)
+
+        btn = ttk.Button(frm, text="Отменить", command=self._request_cancel)
+        btn.grid(row=2, column=0)
+        tip(btn, "Прервать текущую операцию. Уже запущенные внешние процессы будут остановлены.")
+
+        win.update_idletasks()
+        req_w = max(win.winfo_reqwidth(), 420)
+        req_h = win.winfo_reqheight()
+        win.minsize(420, max(req_h, 110))
+        rw = self.root.winfo_rootx()
+        rh = self.root.winfo_rooty()
+        ww = self.root.winfo_width()
+        wh = self.root.winfo_height()
+        win.geometry(f"+{rw + (ww - req_w) // 2}+{rh + (wh - req_h) // 2}")
+
+        win.grab_set()
+        self._progress_win = win
+        self._progress_bar = bar
+
+    def _hide_progress(self) -> None:
+        win = self._progress_win
+        self._progress_win = None
+        if win is None:
+            return
+        with contextlib.suppress(tk.TclError):
+            if getattr(self, "_progress_bar", None) is not None:
+                self._progress_bar.stop()
+            win.grab_release()
+            win.destroy()
+
+    def _set_progress(self, status: str) -> None:
+        def apply(msg: str = status) -> None:
+            self.var_progress.set(msg)
+            self.var_status.set(msg)
+            win = self._progress_win
+            if win is not None:
+                with contextlib.suppress(tk.TclError):
+                    win.update_idletasks()
+
+        self.root.after(0, apply)
+
+    def _report_progress(self, status: str) -> None:
+        """Update progress window / status and append a journal line."""
+        self._set_progress(status)
+        self.log(status)
+
+    def _request_cancel(self) -> None:
+        request_cancel()
+        self.var_progress.set("Отмена…")
+        self.var_status.set("Отмена…")
+        self.log("[ОТМЕНА] Запрошена остановка операции…")
+
+    def _run_bg(
+        self,
+        work: Callable[[], None],
+        status: str = "Выполняется…",
+        *,
+        on_done: Callable[[], None] | None = None,
+    ) -> None:
+        if self._busy:
+            self.var_status.set("Дождитесь завершения текущей операции…")
+            return
+
+        cancel_reset()
+        # Показать окно и текст этапа сразу в UI-потоке (до старта фоновой работы).
+        self._set_busy(True, status)
+        self._show_progress(status)
+
         def runner() -> None:
-            self.root.after(0, lambda: self._set_busy(True, status))
+            cancelled = False
+            failed = False
             try:
                 work()
+            except CancelledError:
+                cancelled = True
+                self.log("[ОТМЕНА] Операция прервана пользователем.")
             except Exception as exc:  # noqa: BLE001 — show in UI
+                failed = True
                 self.log(f"[ERROR] {exc}")
                 err = str(exc)
 
@@ -573,9 +824,28 @@ class GuiApp:
 
                 self.root.after(0, show_error)
             finally:
-                self.root.after(0, lambda: self._set_busy(False, "Готово"))
+
+                def finish_ui() -> None:
+                    self._hide_progress()
+                    self._set_busy(False, "Отменено" if cancelled else "Готово")
+                    if on_done is not None and not cancelled and not failed:
+                        on_done()
+
+                self.root.after(0, finish_ui)
 
         threading.Thread(target=runner, daemon=True).start()
+
+    def _cfe_path_for(self, name: str, output: str) -> str:
+        """Путь .cfe: каталог результата / <имя расширения>.cfe."""
+        return str(Path(output) / f"{name}.cfe")
+
+    def _resolve_git(self) -> tuple[str, str]:
+        """Return (git_repo, dump_prefix) from Configuration.xml path."""
+        cf = self.var_config.get().strip()
+        if not cf:
+            raise GitError("Укажите файл Configuration.xml выгрузки CF (не каталог репозитория)")
+        root, prefix = resolve_cf_location(cf)
+        return str(root), prefix
 
     def _collect_params(self) -> PipelineParams:
         purpose_ui = self.var_purpose.get().strip()
@@ -585,13 +855,21 @@ class GuiApp:
             purpose = purpose_ui
         else:
             purpose = "Customization"
+        name = self.var_name.get().strip()
+        output = self.var_output.get().strip()
+        cfe = self._cfe_path_for(name, output) if name and output else ""
+        git_repo, dump_prefix = "", ""
+        cf = self.var_config.get().strip()
+        if cf:
+            with contextlib.suppress(GitError):
+                git_repo, dump_prefix = self._resolve_git()
         return PipelineParams(
-            name=self.var_name.get().strip(),
-            config=self.var_config.get().strip(),
-            git_repo=self.var_git_repo.get().strip(),
-            dump_prefix=self.var_dump_prefix.get().strip(),
-            output=self.var_output.get().strip(),
-            cfe=self.var_cfe.get().strip(),
+            name=name,
+            config=cf,
+            git_repo=git_repo,
+            dump_prefix=dump_prefix,
+            output=output,
+            cfe=cfe,
             ib_path=self.var_ib_path.get().strip(),
             ibcmd=self.var_ibcmd.get().strip(),
             user=self.var_user.get().strip(),
@@ -608,36 +886,75 @@ class GuiApp:
         )
 
     def _validate_preview(self, p: PipelineParams) -> None:
+        if not p.config:
+            raise GitError("Укажите файл Configuration.xml выгрузки CF (не каталог репозитория)")
         if not p.git_repo:
-            raise GitError("Укажите репозиторий git")
+            # Force a clear error from resolve
+            self._resolve_git()
         if not p.diff_from or not p.diff_to:
             raise GitError("Укажите диапазон «С»…«По» или идентификатор коммита")
 
     def _validate_run(self, p: PipelineParams) -> None:
         self._validate_preview(p)
-        if not p.name:
-            raise ValueError("Укажите имя расширения")
+        validate_extension_names(p.name, p.prefix or None)
         if not p.output:
             raise ValueError("Укажите каталог результата")
-        if not p.skip_build:
-            if not p.cfe:
-                raise ValueError("Укажите путь к файлу .cfe или включите «Только XML»")
-            if not p.ib_path:
-                raise ValueError("Укажите каталог ИБ или включите «Только XML»")
+        if not p.skip_build and not p.ib_path:
+            raise ValueError("Укажите каталог ИБ или включите «Только XML»")
 
     # ------------------------------------------------------------------ commits / preview
     def refresh_commits(self) -> None:
         def work() -> None:
-            repo = self.var_git_repo.get().strip()
-            if not repo:
-                raise GitError("Укажите репозиторий git")
-            self.log(f"Загрузка своих коммитов из {repo}…")
-            commits = list_own_commits(repo, max_count=150)
-            self._commits = commits
-            self.root.after(0, lambda: self._fill_commits(commits))
-            self.log(f"Найдено коммитов: {len(commits)}")
+            repo, prefix = self._resolve_git()
+            name, email = "", ""
+            try:
+                name, email = get_git_identity(repo)
+                self.log(f"Я (git): {name} <{email}>")
+            except GitError as exc:
+                self.log(f"[ПРЕДУПРЕЖДЕНИЕ] {exc}")
+            pref = prefix or "(корень)"
+            self.log(f"CF → git: {repo}  ·  префикс: {pref}")
+            self.log("Загрузка коммитов…")
+            commits = list_commits(repo, max_count=150, own_only=False)
+            self._commits_all = commits
+            self._git_author_name = name
+            self._git_author_email = email
+
+            def apply_ui() -> None:
+                if name or email:
+                    self.var_git_identity.set(f"Я: {name} <{email}>".strip())
+                else:
+                    self.var_git_identity.set("Я: (не задано в git config)")
+                self._apply_commit_filters()
+
+            self.root.after(0, apply_ui)
+            self.log(f"Загружено коммитов: {len(commits)}")
+            if not commits:
+                self.log("Список пуст: в текущей ветке нет коммитов (проверьте каталог конфигурации / git).")
 
         self._run_bg(work, "Загрузка коммитов…")
+
+    def _apply_commit_filters(self, *_args: object) -> None:
+        own_only = bool(self.var_own_commits_only.get())
+        query = self.var_commit_search.get().strip().lower()
+        filtered: list[CommitInfo] = []
+        for c in self._commits_all:
+            if own_only and not commit_is_mine(
+                c,
+                author_name=self._git_author_name,
+                author_email=self._git_author_email,
+            ):
+                continue
+            if query:
+                hay = f"{c.hash} {c.short_hash} {c.author_name} {c.author_email} {c.subject}".lower()
+                if query not in hay:
+                    continue
+            filtered.append(c)
+        self._commits = filtered
+        self._fill_commits(filtered)
+        if own_only and self._commits_all and not filtered and not query:
+            who = self.var_git_identity.get() or "git user"
+            self.var_status.set(f"Нет коммитов для {who}; сверьте колонку «Автор» или снимите «Только свои»")
 
     def _fill_commits(self, commits: list[CommitInfo]) -> None:
         self.commit_tree.delete(*self.commit_tree.get_children())
@@ -646,7 +963,7 @@ class GuiApp:
                 "",
                 tk.END,
                 iid=c.hash,
-                values=(c.short_hash, c.author_date[:19], c.subject),
+                values=(c.hash, c.author_date[:19], c.author_name, c.subject),
             )
 
     def _selected_commit(self) -> CommitInfo | None:
@@ -660,35 +977,36 @@ class GuiApp:
         return None
 
     def _on_commit_select(self, _event: object | None = None) -> None:
-        # optional: show hint in status
-        c = self._selected_commit()
-        if c:
-            self.var_status.set(f"Выбран: {c.short_hash} — {c.subject}")
-
-    def select_commit_as_to(self) -> None:
         c = self._selected_commit()
         if not c:
-            messagebox.showinfo("Коммит", "Выберите коммит в списке или введите ID выше")
             return
-        self.var_commit_id.set(c.hash)
-        self.apply_commit_id()
+        self.var_status.set(f"Выбран: {c.short_hash} — {c.subject}")
+        if self._busy:
+            return
+        if self.var_diff_to.get().strip() == c.hash:
+            return
+        self.apply_commit(c.hash)
 
-    def apply_commit_id(self) -> None:
+    def apply_commit(self, commit_id: str) -> None:
+        """Set DiffFrom/DiffTo from commit (parent..commit) and preview changes."""
+        commit_id = commit_id.strip()
+        if not commit_id:
+            return
+        result: dict[str, str] = {}
+
         def work() -> None:
-            repo = self.var_git_repo.get().strip()
-            commit_id = self.var_commit_id.get().strip()
-            if not repo:
-                raise GitError("Укажите репозиторий git")
-            if not commit_id:
-                raise GitError("Введите идентификатор коммита (полный или короткий хеш)")
+            repo, _prefix = self._resolve_git()
             from_rev, to_rev = range_for_commit(repo, commit_id)
-            self.root.after(0, lambda: self.var_diff_from.set(from_rev))
-            self.root.after(0, lambda: self.var_diff_to.set(to_rev))
-            self.root.after(0, lambda: self.var_commit_id.set(to_rev))
+            result["from"] = from_rev
+            result["to"] = to_rev
             self.log(f"Коммит {to_rev[:12]}: С={from_rev[:12]} По={to_rev[:12]}")
-            self.root.after(0, self.preview_changes)
 
-        self._run_bg(work, "Разбор коммита…")
+        def after_ok() -> None:
+            self.var_diff_from.set(result["from"])
+            self.var_diff_to.set(result["to"])
+            self.preview_changes()
+
+        self._run_bg(work, "Разбор коммита…", on_done=after_ok)
 
     def preview_changes(self) -> None:
         def work() -> None:
@@ -704,10 +1022,12 @@ class GuiApp:
             self._changed_repo_paths = files
             objects, unmapped = map_repo_paths_to_objects(files, dump_prefix=p.dump_prefix or None)
             self.log(f"Изменённых файлов: {len(files)}; объектов: {len(objects)}")
-            for u in unmapped[:20]:
-                self.log(f"[WARN] Не сопоставлен с метаданными: {u}")
-            if len(unmapped) > 20:
-                self.log(f"[WARN] …и ещё {len(unmapped) - 20}")
+            service = {"version", "configdumpinfo.xml", "configuration.xml"}
+            notable = [u for u in unmapped if Path(u).name.lower() not in service]
+            for u in notable[:20]:
+                self.log(f"[WARN] Не включён в расширение (не объект метаданных): {u}")
+            if len(notable) > 20:
+                self.log(f"[WARN] …и ещё {len(notable) - 20}")
 
             rows: list[tuple[str, str, str, str]] = []
             # object-level unique first
@@ -783,16 +1103,44 @@ class GuiApp:
         self.var_dry_run.set(True)
         self.run_pipeline()
 
+    def _confirm_cfe_overwrite(self, p: PipelineParams) -> bool:
+        """Ask to overwrite existing .cfe; return False if user cancels."""
+        if p.skip_build or p.dry_run or not p.cfe:
+            return True
+        cfe_path = Path(p.cfe)
+        if not cfe_path.is_file():
+            return True
+        return bool(
+            messagebox.askyesno(
+                "Файл уже существует",
+                f"Файл .cfe уже существует:\n{cfe_path}\n\nПерезаписать?",
+                icon="warning",
+            )
+        )
+
     def run_pipeline(self) -> None:
+        try:
+            p = self._collect_params()
+            self._validate_run(p)
+        except (ValueError, GitError) as exc:
+            messagebox.showerror("Ошибка", str(exc))
+            return
+        if not self._confirm_cfe_overwrite(p):
+            self.var_status.set("Отменено")
+            self.log("[ОТМЕНА] Перезапись .cfe отклонена пользователем.")
+            return
+
         def work() -> None:
             p = self._collect_params()
             self._validate_run(p)
+            self._report_progress("Подготовка базы и изменений из git…")
             self.log("=== Подготовка базы и изменений из git ===")
             pair = prepare_pair_from_git(
                 p.git_repo,
                 p.diff_from,
                 p.diff_to,
                 dump_prefix=p.dump_prefix or None,
+                on_progress=self._report_progress,
             )
             for w in pair.changes.warnings:
                 self.log(f"[ПРЕДУПРЕЖДЕНИЕ] {w}")
@@ -800,18 +1148,25 @@ class GuiApp:
             self.log(f"Изменения ({p.diff_to}): {pair.changes.staging_dir} ({pair.changes.exported} файлов)")
 
             try:
+                self._report_progress("Предварительный анализ изменений…")
                 inv = build_inventory(pair.config_dir, pair.changes.staging_dir)
                 self.log(
                     f"Инвентаризация: изменено={len(inv.changed_files)} "
                     f"заимствовать={len(inv.borrow_objects)} новые={len(inv.new_objects)} "
-                    f"модули={len(inv.bsl_files)}"
+                    f"модули={len(inv.bsl_files)} макеты={len(inv.template_files)}"
                 )
                 for w in inv.warnings:
                     self.log(f"[ПРЕДУПРЕЖДЕНИЕ] {w}")
+            except CancelledError:
+                for d in pair.temp_dirs:
+                    shutil.rmtree(d, ignore_errors=True)
+                raise
             except Exception as exc:  # noqa: BLE001
                 self.log(f"[ПРЕДУПРЕЖДЕНИЕ] не удалось построить инвентаризацию: {exc}")
 
             self.log("=== Сборка расширения ===")
+            if not p.skip_build:
+                self.log(f"Файл .cfe: {p.cfe}")
             try:
                 report = run_cfe_from_diff(
                     name=p.name,
@@ -828,9 +1183,13 @@ class GuiApp:
                     skip_build=p.skip_build,
                     dry_run=p.dry_run,
                     force_output=p.force,
+                    on_progress=self._report_progress,
                 )
-            except (CfeInitError, CfeBorrowError, IbcmdError, FileNotFoundError, ValueError) as exc:
-                self.log(f"[ОШИБКА] {exc}")
+            except (CancelledError, CfeInitError, CfeBorrowError, IbcmdError, FileNotFoundError, ValueError) as exc:
+                if isinstance(exc, CancelledError):
+                    self.log("[ОТМЕНА] Сборка прервана.")
+                else:
+                    self.log(f"[ОШИБКА] {exc}")
                 raise
             finally:
                 for d in pair.temp_dirs:
@@ -839,19 +1198,18 @@ class GuiApp:
                     self.log("Временные каталоги удалены")
 
             self._log_report(report)
-            self.root.after(
-                0,
-                lambda: messagebox.showinfo(
-                    "Готово",
-                    f"Заимствовано: {len(report.borrowed)}\n"
-                    f"Новых объектов: {len(report.new_objects)}\n"
-                    f"Модулей BSL: {len(report.bsl_files)}\n"
-                    f"Собран .cfe: {'да' if report.built else 'нет'}\n"
-                    f"Ошибок проверки: {report.validate_errors}",
-                ),
+            summary = (
+                f"Заимствовано: {len(report.borrowed)}\n"
+                f"Новых объектов: {len(report.new_objects)}\n"
+                f"Модулей BSL: {len(report.bsl_files)}\n"
+                f"Макетов (СКД/XML): {len(report.template_files)}\n"
+                f"Собран .cfe: {'да' if report.built else 'нет'}"
             )
+            if report.validate_errors:
+                summary += f"\n\nЗамечаний cfe-validate: {report.validate_errors}\n(см. журнал; .cfe всё равно собран)"
+            self.root.after(0, lambda s=summary: messagebox.showinfo("Готово", s))  # type: ignore[misc]
 
-        self._run_bg(work, "Сборка…")
+        self._run_bg(work, "Подготовка базы и изменений из git…")
 
     def _log_report(self, report: RunReport) -> None:
         self.log("=== Итог ===")
@@ -865,6 +1223,9 @@ class GuiApp:
         self.log(f"  Модули BSL:    {len(report.bsl_files)}")
         for b in report.bsl_files:
             self.log(f"    - {b}")
+        self.log(f"  Макеты:        {len(report.template_files)}")
+        for t in report.template_files:
+            self.log(f"    - {t}")
         self.log(f"  Собран .cfe:   {'да' if report.built else 'нет'}")
         if report.cfe:
             self.log(f"  Файл .cfe:     {report.cfe}")
@@ -872,7 +1233,39 @@ class GuiApp:
             self.log(f"  [ПРЕДУПРЕЖДЕНИЕ] {w}")
 
 
+def _ensure_stdio() -> None:
+    """Under pythonw stdout/stderr are None — provide safe stubs for print/reconfigure."""
+
+    class _DevNull:
+        encoding = "utf-8"
+        errors = "replace"
+
+        def write(self, s: object) -> int:
+            if s is None:
+                return 0
+            return len(str(s))
+
+        def flush(self) -> None:
+            return None
+
+        def reconfigure(self, **_kwargs: object) -> None:
+            return None
+
+        def isatty(self) -> bool:
+            return False
+
+        @property
+        def buffer(self) -> None:
+            return None
+
+    if sys.stdout is None:
+        sys.stdout = _DevNull()  # type: ignore[assignment]
+    if sys.stderr is None:
+        sys.stderr = _DevNull()  # type: ignore[assignment]
+
+
 def main() -> int:
+    _ensure_stdio()
     root = tk.Tk()
     # Prefer native theme on Windows
     try:

@@ -295,6 +295,10 @@ TYPES_WITH_CHILD_OBJECTS = [
     "AccumulationRegister",
     "AccountingRegister",
     "CalculationRegister",
+    "Report",
+    "DataProcessor",
+    "DocumentJournal",
+    "CommonForm",
 ]
 
 COMMON_MODULE_PROPS = [
@@ -418,8 +422,12 @@ def new_guid():
 
 
 def main():
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
+    _reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(_reconfigure):
+        _reconfigure(encoding="utf-8")
+    _reconfigure = getattr(sys.stderr, "reconfigure", None)
+    if callable(_reconfigure):
+        _reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Borrow objects from configuration into extension", allow_abbrev=False)
     parser.add_argument("-ExtensionPath", required=True)
     parser.add_argument("-ConfigPath", required=True)

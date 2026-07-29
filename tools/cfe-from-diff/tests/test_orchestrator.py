@@ -161,13 +161,16 @@ def test_force_allows_clean_rerun(tmp_path: Path):
     assert report.borrowed
 
 
-def test_validate_errors_skip_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_validate_errors_still_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cfg = make_config_tree(tmp_path / "config")
     ch = make_changes_tree(tmp_path / "changes")
     out = tmp_path / "ext"
     built = {"called": False}
 
-    monkeypatch.setattr("cfe_tools.orchestrator.validate_extension", lambda *_a, **_k: 3)
+    monkeypatch.setattr(
+        "cfe_tools.orchestrator.validate_extension",
+        lambda *_a, **_k: (3, ["[ERROR] example check failed"]),
+    )
 
     def fake_build(*_a, **_k):
         built["called"] = True
@@ -187,6 +190,8 @@ def test_validate_errors_skip_build(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         prefix="TestExt_",
     )
     assert report.validate_errors == 3
-    assert report.built is False
-    assert built["called"] is False
-    assert any("Skipping ibcmd build" in w for w in report.warnings)
+    assert report.built is True
+    assert built["called"] is True
+    assert any("cfe-validate" in w for w in report.warnings)
+    assert any("example check failed" in w for w in report.warnings)
+    assert not any("Skipping ibcmd build" in w for w in report.warnings)

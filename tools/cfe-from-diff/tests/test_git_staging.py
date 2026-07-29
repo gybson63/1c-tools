@@ -8,8 +8,12 @@ from pathlib import Path
 import pytest
 
 from cfe_tools.git_staging import (
+    CommitInfo,
     GitError,
+    commit_is_mine,
     commit_parent,
+    decode_git_c_quoted,
+    decode_git_quoted_paths,
     export_changes_tree,
     get_file_diff,
     list_changed_files,
@@ -17,6 +21,7 @@ from cfe_tools.git_staging import (
     map_repo_paths_to_objects,
     normalize_dump_prefix,
     prepare_changes_from_git,
+    resolve_cf_location,
     strip_dump_prefix,
 )
 
@@ -58,6 +63,89 @@ def test_normalize_and_strip_prefix():
     assert strip_dump_prefix("Catalogs/X.xml", "") == "Catalogs/X.xml"
 
 
+def test_commit_is_mine_email_or_name():
+    c = CommitInfo(
+        hash="a" * 40,
+        short_hash="abcdef0",
+        subject="fix",
+        author_name="Ivan Petrov",
+        author_email="ivan@corp.local",
+        author_date="2026-01-01T00:00:00+00:00",
+    )
+    # email mismatch, name match → mine
+    assert commit_is_mine(c, author_name="Ivan Petrov", author_email="other@example.com")
+    # email match, name mismatch → mine
+    assert commit_is_mine(c, author_name="Someone", author_email="ivan@corp.local")
+    # case-insensitive
+    assert commit_is_mine(c, author_name="ivan petrov", author_email="")
+    assert commit_is_mine(c, author_name="", author_email="IVAN@CORP.LOCAL")
+    # both mismatch → not mine
+    assert not commit_is_mine(c, author_name="Other", author_email="other@example.com")
+    assert not commit_is_mine(c, author_name="", author_email="")
+
+
+def test_list_own_commits_matches_by_name_when_email_differs(tmp_path: Path):
+    repo = _init_repo(tmp_path, name="Test User", email="test@example.com")
+    _commit_file(repo, "a.txt", "1", "mine")
+    # Same name, different email in config vs what was used for commit — recreate identity
+    _git(repo, "config", "user.email", "alias@example.com")
+    # Commit was authored as test@example.com; filter by name should still find it
+    commits = list_own_commits(repo, author_name="Test User", author_email="alias@example.com")
+    assert any(c.subject == "mine" for c in commits)
+
+
+def test_resolve_cf_location_from_configuration_xml(tmp_path: Path):
+    repo = _init_repo(tmp_path)
+    cf = repo / "src" / "cf"
+    cf.mkdir(parents=True)
+    cfg = cf / "Configuration.xml"
+    cfg.write_text("<Config/>", encoding="utf-8")
+    (cf / "CommonModules").mkdir()
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "init dump")
+
+    root, prefix = resolve_cf_location(cfg)
+    assert root == repo.resolve()
+    assert prefix == "src/cf"
+
+    # Dump directory still accepted if it contains Configuration.xml
+    root2, prefix2 = resolve_cf_location(cf)
+    assert root2 == repo.resolve()
+    assert prefix2 == "src/cf"
+
+
+def test_resolve_cf_location_dump_at_repo_root(tmp_path: Path):
+    repo = _init_repo(tmp_path)
+    cfg = repo / "Configuration.xml"
+    cfg.write_text("<Config/>", encoding="utf-8")
+    (repo / "CommonModules").mkdir()
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "root dump")
+    root, prefix = resolve_cf_location(cfg)
+    assert root == repo.resolve()
+    assert prefix == ""
+
+
+def test_resolve_cf_location_rejects_repo_root_without_xml(tmp_path: Path):
+    repo = _init_repo(tmp_path)
+    (repo / "src" / "cf").mkdir(parents=True)
+    (repo / "src" / "cf" / "Configuration.xml").write_text("<Config/>", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "nested")
+    with pytest.raises(GitError, match="Configuration.xml"):
+        resolve_cf_location(repo)
+
+
+def test_resolve_cf_location_errors(tmp_path: Path):
+    lonely = tmp_path / "no-git" / "cf"
+    lonely.mkdir(parents=True)
+    (lonely / "Configuration.xml").write_text("<Config/>", encoding="utf-8")
+    with pytest.raises(GitError, match="не найден"):
+        resolve_cf_location(lonely / "Configuration.xml")
+    with pytest.raises(GitError, match="не найден"):
+        resolve_cf_location(tmp_path / "missing" / "Configuration.xml")
+
+
 def test_list_own_commits_filters_by_identity(tmp_path: Path):
     repo = _init_repo(tmp_path)
     h1 = _commit_file(repo, "Catalogs/A.xml", "v1", "mine first")
@@ -79,6 +167,34 @@ def test_list_own_commits_filters_by_identity(tmp_path: Path):
     assert "foreign" not in subjects
     hashes = {c.hash for c in commits}
     assert h1 in hashes and h3 in hashes
+
+
+def test_decode_git_quoted_cyrillic_paths() -> None:
+    # "Заказ" in UTF-8 as git octal escapes
+    inner = r"a/src/cf/Documents/\320\227\320\260\320\272\320\260\320\267.xml"
+    assert decode_git_c_quoted(inner) == "a/src/cf/Documents/Заказ.xml"
+
+    header = (
+        r'diff --git "a/src/cf/Documents/\320\227\320\260\320\272\320\260\320\267'
+        r'\320\237\320\276\320\272\321\203\320\277.xml" '
+        r'"b/src/cf/Documents/\320\227\320\260\320\272\320\260\320\267'
+        r'\320\237\320\276\320\272\321\203\320\277.xml"'
+    )
+    decoded = decode_git_quoted_paths(header)
+    assert "\\320" not in decoded
+    assert "ЗаказПокуп.xml" in decoded
+    assert decoded.startswith("diff --git a/")
+
+
+def test_get_file_diff_cyrillic_path_readable(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    path = "Documents/ЗаказПокуп.xml"
+    h1 = _commit_file(repo, path, "<a/>", "base")
+    h2 = _commit_file(repo, path, "<b/>", "change")
+    diff = get_file_diff(repo, h1, h2, path)
+    assert "\\320" not in diff
+    assert "ЗаказПокуп.xml" in diff
+    assert "+<b/>" in diff.replace("\r", "")
 
 
 def test_list_changed_files_and_diff(tmp_path: Path):

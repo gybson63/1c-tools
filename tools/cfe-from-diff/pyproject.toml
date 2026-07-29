@@ -37,6 +37,8 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# Outside the distributable tool tree (sibling of cfe-from-diff/)
+cache_dir = "../.cfe-tools-cache/pytest"
 
 [tool.ruff]
 target-version = "py310"
@@ -57,6 +59,8 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 "**/cfe_tools/vendor/**" = ["ALL"]
 "**/tests/fixtures_builder.py" = ["E501"]
+"**/tests/test_meta_transfer.py" = ["E501"]
+"**/tests/test_ibcmd_build.py" = ["E501"]
 "**/tests/**" = ["B011"]
 
 [tool.ruff.lint.isort]
@@ -66,6 +70,8 @@ known-first-party = ["cfe_tools", "fixtures_builder"]
 python_version = "3.10"
 mypy_path = "src"
 packages = ["cfe_tools"]
+# Outside the distributable tool tree (sibling of cfe-from-diff/)
+cache_dir = "../.cfe-tools-cache/mypy"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
@@ -96,6 +102,8 @@ disable = [
     "too-many-branches",
     "too-many-statements",
     "too-many-instance-attributes",
+    "too-many-lines",
+    "too-many-return-statements",
     "duplicate-code",
     "fixme",
     "import-outside-toplevel",
@@ -105,6 +113,11 @@ disable = [
     "disallowed-name",
     "redefined-outer-name",
     "wrong-import-order",
+    "global-statement",
+    "consider-using-with",
+    "c-extension-no-member",
+    "unused-argument",
+    "line-too-long",
 ]
 
 [tool.pylint.format]

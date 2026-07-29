@@ -24,6 +24,7 @@ cfe-from-diff/
 ```
 
 Не нужны: `.git`, `.pre-commit-config.yaml`, ruff/mypy/pylint — они живут в корне монорепо.
+Кэши pytest/mypy пишутся в `../.cfe-tools-cache/` (рядом с папкой инструмента), не внутрь `cfe-from-diff`.
 
 ## Требования на целевом ПК
 
@@ -45,13 +46,23 @@ python -m pip install .
 
 ## Запуск
 
-GUI:
+Из этой папки (рекомендуется — не зависит от старого `pip install`):
 
 ```powershell
-cfe-from-diff-gui
-# или без entrypoint:
+powershell -ExecutionPolicy Bypass -File .\run-gui.ps1
+# или:
+.\run-gui.bat
+```
+
+Либо установить пакет и запускать модуль:
+
+```powershell
+python -m pip install -e .
 python -m cfe_tools.gui_app
 ```
+
+Важно: команда `python -m cfe_tools.gui_app` **без** `pip install -e .` и без `PYTHONPATH=src`
+подхватит старую установку `cfe-tools` из site-packages (если она есть), а не код из `src\`.
 
 CLI:
 
@@ -64,7 +75,7 @@ cfe-from-diff --help
 
 ### GUI — краткий сценарий
 
-1. Укажите **Git repo**, **Output** и при необходимости DumpPrefix.
+1. Укажите **Configuration.xml** выгрузки основной CF (именно файл, не папку) — корень git и префикс выгрузки определяются сами.
 2. **Обновить список** — свои коммиты текущей ветки (`git user.name` / `user.email`).
 3. Выберите коммит → **Выбрать как To** → **Показать изменения**.
 4. Клик по файлу — unified diff.

@@ -241,8 +241,12 @@ def create_extension(
 
 
 def main():
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
+    _reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(_reconfigure):
+        _reconfigure(encoding="utf-8")
+    _reconfigure = getattr(sys.stderr, "reconfigure", None)
+    if callable(_reconfigure):
+        _reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Create 1C configuration extension scaffold", allow_abbrev=False)
     parser.add_argument("-Name", dest="Name", required=True)
     parser.add_argument("-Synonym", dest="Synonym", default=None)
