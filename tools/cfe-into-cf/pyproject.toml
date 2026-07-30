@@ -1,0 +1,105 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cfe-into-cf"
+version = "0.1.0"
+description = "Transfer 1C configuration extension content into the main configuration via Designer batch mode"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Timur Gazaliev" }]
+dependencies = [
+    "lxml>=4.9",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+dev = [
+    "cfe-into-cf[test]",
+    "ruff>=0.12",
+    "mypy>=1.17",
+    "pylint>=3.3",
+    "pre-commit>=4.0",
+    "types-lxml",
+]
+
+[project.scripts]
+cfe-into-cf = "cfe_into_cf.cli:main"
+cfe-into-cf-gui = "cfe_into_cf.gui_app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+cache_dir = "../.cfe-tools-cache/pytest-into-cf"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "SIM",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["B011", "E501"]
+"**/tests/fixtures_builder.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cfe_into_cf"]
+
+[tool.mypy]
+python_version = "3.10"
+mypy_path = "src"
+packages = ["cfe_into_cf"]
+cache_dir = "../.cfe-tools-cache/mypy-into-cf"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.pylint.main]
+jobs = 0
+py-version = "3.10"
+source-roots = ["src"]
+
+[tool.pylint.messages_control]
+disable = [
+    "missing-module-docstring",
+    "missing-class-docstring",
+    "missing-function-docstring",
+    "too-few-public-methods",
+    "too-many-arguments",
+    "too-many-positional-arguments",
+    "too-many-locals",
+    "too-many-branches",
+    "too-many-statements",
+    "too-many-instance-attributes",
+    "too-many-lines",
+    "too-many-return-statements",
+    "duplicate-code",
+    "fixme",
+    "import-outside-toplevel",
+    "attribute-defined-outside-init",
+    "broad-exception-caught",
+    "subprocess-run-check",
+    "unused-argument",
+    "line-too-long",
+]
+
+[tool.pylint.format]
+max-line-length = 120
