@@ -9,6 +9,7 @@
 | Каталог | Описание |
 |---------|----------|
 | [tools/cfe-from-diff](tools/cfe-from-diff) | Сборка расширения (CFE) из git-diff / выгрузки CF; CLI + GUI |
+| [tools/cfe-into-cf](tools/cfe-into-cf) | Перенос содержимого расширения в основную конфигурацию (ИБ + хранилище); CLI + GUI |
 
 ## Как перенести один инструмент на другой ПК
 
@@ -24,6 +25,9 @@ Copy-Item -Recurse tools\cfe-from-diff C:\work\cfe-from-diff
 ```powershell
 powershell -File scripts\pack-cfe-from-diff.ps1
 # результат: dist\cfe-from-diff-*.zip
+
+powershell -File scripts\pack-cfe-into-cf.ps1
+# результат: dist\cfe-into-cf-*.zip
 ```
 
 Дальше установка и запуск — в README внутри этой папки. Корневые lint/pre-commit на целевой ПК не нужны.
