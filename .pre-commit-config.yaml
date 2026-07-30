@@ -3,19 +3,21 @@ repos:
     rev: v0.12.5
     hooks:
       - id: ruff
-        args: [--fix]
+        args: [--fix, --config=tools/cfe-from-diff/pyproject.toml]
+        files: ^tools/cfe-from-diff/
       - id: ruff-format
+        args: [--config=tools/cfe-from-diff/pyproject.toml]
+        files: ^tools/cfe-from-diff/
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.17.0
+  - repo: local
     hooks:
-      - id: mypy
-        additional_dependencies:
-          - types-lxml
-          - lxml>=4.9
-        args: [--config-file=pyproject.toml]
+      - id: mypy-cfe-from-diff
+        name: mypy (cfe-from-diff)
+        language: system
+        entry: python scripts/run_mypy_cfe.py
         pass_filenames: false
         always_run: true
+        files: ^tools/cfe-from-diff/
 
   - repo: https://github.com/pylint-dev/pylint
     rev: v3.3.7
@@ -25,8 +27,8 @@ repos:
           - lxml>=4.9
           - pytest>=7.0
         args:
-          - --rcfile=pyproject.toml
-          - src
-          - tests
+          - --rcfile=tools/cfe-from-diff/pyproject.toml
+          - tools/cfe-from-diff/src
+          - tools/cfe-from-diff/tests
         pass_filenames: false
         always_run: true

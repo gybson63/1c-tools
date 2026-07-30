@@ -3,7 +3,11 @@
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 """Validates extension Configuration.xml: root, InternalInfo, extension properties, ChildObjects, borrowed objects."""
 
-import sys, os, argparse, re
+import argparse
+import os
+import re
+import sys
+
 from lxml import etree
 
 NS = {
@@ -222,8 +226,12 @@ class Reporter:
 
 
 def main():
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
+    _reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(_reconfigure):
+        _reconfigure(encoding="utf-8")
+    _reconfigure = getattr(sys.stderr, "reconfigure", None)
+    if callable(_reconfigure):
+        _reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(
         description="Validate 1C configuration extension XML structure (CFE)", allow_abbrev=False
     )
@@ -871,7 +879,7 @@ def main():
             r.warn(f"11. {ctx}: Ext/Form/Module.bsl missing")
 
         # Read Form.xml as raw text for BaseForm checks
-        with open(form_xml_file, "r", encoding="utf-8-sig") as f:
+        with open(form_xml_file, encoding="utf-8-sig") as f:
             form_raw_text = f.read()
 
         if "<BaseForm" in form_raw_text:
@@ -1014,26 +1022,44 @@ class CfeValidateError(Exception):
 def validate_extension(extension_path, detailed=False, max_errors=30, out_file=""):
     """Validate extension XML structure.
 
-    Returns number of errors (0 means OK). Raises CfeValidateError on hard failures
-    before checks complete.
+    Returns ``(error_count, output_lines)``. Raises CfeValidateError on hard failures
+    before checks complete. Captures validator stdout so callers (GUI under pythonw)
+    still see the actual remarks.
     """
+    import contextlib
+    import io
+
     argv = ["cfe-validate", "-ExtensionPath", extension_path, "-MaxErrors", str(max_errors)]
     if detailed:
         argv.append("-Detailed")
     if out_file:
         argv.extend(["-OutFile", out_file])
 
-    old_argv = sys.argv
-    try:
-        sys.argv = argv
-        main()
-        return 0
-    except SystemExit as exc:
-        code = exc.code
-        if code in (0, None):
-            return 0
-        if isinstance(code, int):
-            return code
-        raise CfeValidateError(f"cfe-validate failed: {code}") from exc
-    finally:
-        sys.argv = old_argv
+    from cfe_tools.vendor import ARGV_LOCK
+
+    buf = io.StringIO()
+    exit_code = 0
+    with ARGV_LOCK:
+        old_argv = sys.argv
+        try:
+            sys.argv = argv
+            with contextlib.redirect_stdout(buf):
+                try:
+                    main()
+                except SystemExit as exc:
+                    code = exc.code
+                    if code in (0, None):
+                        exit_code = 0
+                    elif isinstance(code, int):
+                        exit_code = code
+                    else:
+                        raise CfeValidateError(f"cfe-validate failed: {code}") from exc
+        finally:
+            sys.argv = old_argv
+
+    text = buf.getvalue().replace("\r\n", "\n")
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    errors = sum(1 for ln in lines if ln.startswith("[ERROR]"))
+    if errors == 0 and exit_code:
+        errors = 1
+    return errors, lines

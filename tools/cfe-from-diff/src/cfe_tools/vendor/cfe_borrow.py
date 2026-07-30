@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import uuid
+
 from lxml import etree
 
 MD_NS = "http://v8.1c.ru/8.3/MDClasses"
@@ -294,6 +295,10 @@ TYPES_WITH_CHILD_OBJECTS = [
     "AccumulationRegister",
     "AccountingRegister",
     "CalculationRegister",
+    "Report",
+    "DataProcessor",
+    "DocumentJournal",
+    "CommonForm",
 ]
 
 COMMON_MODULE_PROPS = [
@@ -336,7 +341,7 @@ def detect_format_version(d):
     while d:
         cfg_path = os.path.join(d, "Configuration.xml")
         if os.path.isfile(cfg_path):
-            with open(cfg_path, "r", encoding="utf-8-sig") as f:
+            with open(cfg_path, encoding="utf-8-sig") as f:
                 head = f.read(2000)
             m = re.search(r'<MetaDataObject[^>]+version="(\d+\.\d+)"', head)
             if m:
@@ -417,8 +422,12 @@ def new_guid():
 
 
 def main():
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
+    _reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(_reconfigure):
+        _reconfigure(encoding="utf-8")
+    _reconfigure = getattr(sys.stderr, "reconfigure", None)
+    if callable(_reconfigure):
+        _reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Borrow objects from configuration into extension", allow_abbrev=False)
     parser.add_argument("-ExtensionPath", required=True)
     parser.add_argument("-ConfigPath", required=True)
@@ -716,7 +725,7 @@ def main():
 
     # --- 11b. Collect DataPath references from source Form.xml ---
     def collect_form_data_paths(form_xml_path):
-        with open(form_xml_path, "r", encoding="utf-8-sig") as fh:
+        with open(form_xml_path, encoding="utf-8-sig") as fh:
             content = fh.read()
 
         first_level = {}
@@ -982,7 +991,7 @@ def main():
             warn(f"Cannot merge attributes: {obj_file} not found")
             return
 
-        with open(obj_file, "r", encoding="utf-8-sig") as fh:
+        with open(obj_file, encoding="utf-8-sig") as fh:
             obj_content = fh.read()
 
         # Collect existing attribute names for dedup (text-based)
@@ -1057,7 +1066,7 @@ def main():
         adopted_content = "\n".join(content_parts).rstrip()
 
         # Read existing object XML and inject
-        with open(obj_file, "r", encoding="utf-8-sig") as fh:
+        with open(obj_file, encoding="utf-8-sig") as fh:
             obj_content = fh.read()
 
         # Inject extra properties after ExtendedConfigurationObject
@@ -1216,7 +1225,7 @@ def main():
         if not os.path.isfile(src_form_xml_path):
             print(f"Source Form.xml not found: {src_form_xml_path}", file=sys.stderr)
             sys.exit(1)
-        with open(src_form_xml_path, "r", encoding="utf-8-sig") as fh:
+        with open(src_form_xml_path, encoding="utf-8-sig") as fh:
             src_form_content = fh.read()
 
         # 3. Generate form metadata XML
@@ -1754,13 +1763,16 @@ def borrow_objects(extension_path, config_path, objects, borrow_main_attribute=N
         if borrow_main_attribute not in (True, "Form"):
             argv.append(str(borrow_main_attribute))
 
-    old_argv = sys.argv
-    try:
-        sys.argv = argv
-        main()
-    except SystemExit as exc:
-        code = exc.code
-        if code not in (0, None):
-            raise CfeBorrowError(f"cfe-borrow failed with exit code {code}") from exc
-    finally:
-        sys.argv = old_argv
+    from cfe_tools.vendor import ARGV_LOCK
+
+    with ARGV_LOCK:
+        old_argv = sys.argv
+        try:
+            sys.argv = argv
+            main()
+        except SystemExit as exc:
+            code = exc.code
+            if code not in (0, None):
+                raise CfeBorrowError(f"cfe-borrow failed with exit code {code}") from exc
+        finally:
+            sys.argv = old_argv

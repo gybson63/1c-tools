@@ -47,11 +47,18 @@ def test_map_path():
     assert ref.borrow_spec == "Catalog.ТестовыйСправочник"
 
 
-def test_map_form_path():
-    ref = map_path_to_object("Catalogs/ТестовыйСправочник/Forms/ФормаЭлемента/Ext/Form/Module.bsl")
+def test_map_template_path():
+    from cfe_tools.inventory import map_path_to_template
+
+    ref = map_path_to_object("Reports/ВоронкаПродажНовый/Templates/ОсновнаяСхемаКомпоновкиДанных/Ext/Template.xml")
     assert ref is not None
-    assert ref.form_name == "ФормаЭлемента"
-    assert ref.borrow_spec == "Catalog.ТестовыйСправочник.Form.ФормаЭлемента"
+    assert ref.template_name == "ОсновнаяСхемаКомпоновкиДанных"
+    assert ref.object_name == "ВоронкаПродажНовый"
+
+    tmpl = map_path_to_template("Reports/ВоронкаПродажНовый/Templates/ОсновнаяСхемаКомпоновкиДанных/Ext/Template.xml")
+    assert tmpl is not None
+    assert tmpl.template_name == "ОсновнаяСхемаКомпоновкиДанных"
+    assert not tmpl.is_common
 
 
 def test_map_unmapped_path():

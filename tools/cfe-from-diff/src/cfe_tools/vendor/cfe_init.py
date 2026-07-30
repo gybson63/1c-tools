@@ -3,7 +3,10 @@
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 """Generates minimal XML source files for a 1C configuration extension."""
 
-import sys, os, argparse, uuid
+import argparse
+import os
+import sys
+import uuid
 from xml.etree import ElementTree as ET
 
 
@@ -123,7 +126,7 @@ def create_extension(
     if not no_role:
         default_roles_xml = f'\r\n\t\t\t\t<xr:Item xsi:type="xr:MDObjectRef">Role.{role_name}</xr:Item>\r\n\t\t\t'
 
-    child_objects_xml = f"\r\n\t\t\t<Language>Русский</Language>"
+    child_objects_xml = "\r\n\t\t\t<Language>Русский</Language>"
     if not no_role:
         child_objects_xml += f"\r\n\t\t\t<Role>{role_name}</Role>"
     child_objects_xml += "\r\n\t\t"
@@ -238,8 +241,12 @@ def create_extension(
 
 
 def main():
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
+    _reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(_reconfigure):
+        _reconfigure(encoding="utf-8")
+    _reconfigure = getattr(sys.stderr, "reconfigure", None)
+    if callable(_reconfigure):
+        _reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Create 1C configuration extension scaffold", allow_abbrev=False)
     parser.add_argument("-Name", dest="Name", required=True)
     parser.add_argument("-Synonym", dest="Synonym", default=None)

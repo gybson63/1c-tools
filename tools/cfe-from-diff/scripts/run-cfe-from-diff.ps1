@@ -59,7 +59,7 @@ $IbPassword    = $null
 # --- режим запуска ---
 $SkipBuild     = $true                      # только XML; $false — ещё собрать .cfe
 $DryRun        = $false                     # только инвентаризация
-$ForceOutput   = $true                      # --force
+$ForceOutput   = $false                     # --force (wipe existing --output)
 $KeepChanges   = $false                     # не удалять staging после успеха
 $ReportPath    = ""                         # JSON-отчёт; "" = не писать
 # Список файлов из diff (для отладки). "" = не писать
@@ -268,7 +268,20 @@ if ($DryRun) { $cli += "--dry-run" }
 if ($ForceOutput) { $cli += "--force" }
 if ($ReportPath) { $cli += @("--report", $ReportPath) }
 
-Write-Host "Запуск: $CfeFromDiff $($cli -join ' ')"
+$cliForLog = @()
+for ($i = 0; $i -lt $cli.Count; $i++) {
+    if ($cli[$i] -eq "--password" -and ($i + 1) -lt $cli.Count) {
+        $cliForLog += @("--password", "***")
+        $i++
+        continue
+    }
+    if ($cli[$i] -like "--password=*") {
+        $cliForLog += "--password=***"
+        continue
+    }
+    $cliForLog += $cli[$i]
+}
+Write-Host "Запуск: $CfeFromDiff $($cliForLog -join ' ')"
 $exit = Invoke-CfeFromDiff -Command $CfeFromDiff -CliArgs $cli
 
 if ($useTemp -and -not $KeepChanges) {

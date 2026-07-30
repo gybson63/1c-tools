@@ -50,6 +50,9 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
+# cfe-from-diff: pytest/mypy caches live next to the tool, not inside it
+tools/.cfe-tools-cache/
+.cfe-tools-cache/
 
 # Translations
 *.mo

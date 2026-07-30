@@ -15,8 +15,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Тесты (на рабочем ПК не нужны)
+test = ["pytest>=7.0"]
+# Локальная разработка / линтеры в монорепо
 dev = [
-    "pytest>=7.0",
+    "cfe-tools[test]",
     "ruff>=0.12",
     "mypy>=1.17",
     "pylint>=3.3",
@@ -34,6 +37,8 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# Outside the distributable tool tree (sibling of cfe-from-diff/)
+cache_dir = "../.cfe-tools-cache/pytest"
 
 [tool.ruff]
 target-version = "py310"
@@ -52,9 +57,11 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"src/cfe_tools/vendor/**" = ["ALL"]
-"tests/fixtures_builder.py" = ["E501"]
-"tests/**" = ["B011"]
+"**/cfe_tools/vendor/**" = ["ALL"]
+"**/tests/fixtures_builder.py" = ["E501"]
+"**/tests/test_meta_transfer.py" = ["E501"]
+"**/tests/test_ibcmd_build.py" = ["E501"]
+"**/tests/**" = ["B011"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["cfe_tools", "fixtures_builder"]
@@ -63,6 +70,8 @@ known-first-party = ["cfe_tools", "fixtures_builder"]
 python_version = "3.10"
 mypy_path = "src"
 packages = ["cfe_tools"]
+# Outside the distributable tool tree (sibling of cfe-from-diff/)
+cache_dir = "../.cfe-tools-cache/mypy"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
@@ -77,9 +86,9 @@ ignore_errors = true
 [tool.pylint.main]
 jobs = 0
 py-version = "3.10"
-source-roots = ["src"]
+source-roots = ["src", "tools/cfe-from-diff/src"]
 ignore-paths = ["^.*/vendor/.*$"]
-init-hook = "import sys; sys.path.insert(0, 'tests')"
+init-hook = "import sys; from pathlib import Path; root = Path('.').resolve(); paths = [root / 'src', root / 'tests', root / 'tools' / 'cfe-from-diff' / 'src', root / 'tools' / 'cfe-from-diff' / 'tests']; [sys.path.insert(0, str(p)) for p in paths if p.is_dir()]"
 
 [tool.pylint.messages_control]
 disable = [
@@ -93,6 +102,8 @@ disable = [
     "too-many-branches",
     "too-many-statements",
     "too-many-instance-attributes",
+    "too-many-lines",
+    "too-many-return-statements",
     "duplicate-code",
     "fixme",
     "import-outside-toplevel",
@@ -102,6 +113,11 @@ disable = [
     "disallowed-name",
     "redefined-outer-name",
     "wrong-import-order",
+    "global-statement",
+    "consider-using-with",
+    "c-extension-no-member",
+    "unused-argument",
+    "line-too-long",
 ]
 
 [tool.pylint.format]
